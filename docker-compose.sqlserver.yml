@@ -1,0 +1,12 @@
+# Optional: run against real SQL Server locally instead of SQLite.
+#   docker compose -f docker-compose.sqlserver.yml up -d
+#   dotnet run --project src/Rostra.Api --launch-profile sqlserver
+services:
+  sql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Rostra!Local2024"
+    ports:
+      - "1433:1433"

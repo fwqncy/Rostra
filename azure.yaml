@@ -1,0 +1,7 @@
+# Deploy with the Azure Developer CLI:  azd up
+name: rostra
+services:
+  api:
+    project: ./src/Rostra.Api
+    language: dotnet
+    host: appservice
