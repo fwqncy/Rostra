@@ -4,6 +4,8 @@ using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Rostra.Api.Auth;
+using Rostra.Api.Dashboard;
+using Rostra.Api.Home;
 using Rostra.Api.Data;
 using Rostra.Api.Domain;
 using Rostra.Api.Infrastructure;
@@ -27,6 +29,8 @@ builder.Services.AddDbContext<RostraDb>(options =>
 });
 
 builder.Services.AddSingleton<EventHub>();
+if (builder.Configuration.GetValue("Demo:Enabled", false))
+    builder.Services.AddHostedService<DemoCrewService>();
 builder.Services.AddScoped<INotifier, LiveNotifier>();
 builder.Services.AddSingleton<IPasswordHasher<Staff>, PasswordHasher<Staff>>();
 builder.Services.AddMemoryCache();
@@ -66,8 +70,25 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<RostraDb>();
     await db.Database.EnsureCreatedAsync();
+
+    // EnsureCreated can't evolve a schema. A local SQLite demo DB from an older version is simply rebuilt.
+    if (db.Database.IsSqlite() && !await SchemaIsCurrentAsync(db))
+    {
+        app.Logger.LogWarning("Local demo database is from an older version of Rostra; recreating it.");
+        var file = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(db.Database.GetConnectionString()).DataSource;
+        await db.Database.CloseConnectionAsync();
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+        // Remove the WAL/SHM side files too, or SQLite reports a disk I/O error on the fresh file.
+        foreach (var path in new[] { file, $"{file}-wal", $"{file}-shm" })
+            if (File.Exists(path)) File.Delete(path);
+        await db.Database.EnsureCreatedAsync();
+    }
+
     if (app.Configuration.GetValue("Demo:Enabled", false))
+    {
         await SeedData.SeedAsync(db, DateOnly.FromDateTime(DateTime.Today));
+        await DemoCrew.TickAsync(db, null);
+    }
 }
 
 if (!app.Environment.IsDevelopment())
@@ -106,8 +127,22 @@ app.MapHealthChecks("/healthz");
 app.MapAuth();
 app.MapRoster();
 app.MapSwaps();
+app.MapDashboard();
+app.MapHome();
 
 // Client-side routes (/login, /app/schedule, …) all load the single-page app.
 app.MapFallbackToFile("index.html");
 
 app.Run();
+
+static async Task<bool> SchemaIsCurrentAsync(RostraDb db)
+{
+    // Look for the newest table and column without throwing (and logging) on an old schema.
+    var tables = await db.Database
+        .SqlQuery<int>($"SELECT COUNT(*) AS Value FROM sqlite_master WHERE type = 'table' AND name IN ('ClockEvents', 'SiteDays', 'TimeOff')")
+        .SingleAsync();
+    var columns = await db.Database
+        .SqlQuery<int>($"SELECT (SELECT COUNT(*) FROM pragma_table_info('Staff') WHERE name = 'CertificationExpires') + (SELECT COUNT(*) FROM pragma_table_info('Companies') WHERE name = 'TimeZone') AS Value")
+        .SingleAsync();
+    return tables == 3 && columns == 2;
+}

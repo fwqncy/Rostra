@@ -13,6 +13,7 @@ public enum Days { None = 0, Mon = 1, Tue = 2, Wed = 4, Thu = 8, Fri = 16, Sat =
 public class Staff
 {
     private ICollection<Shift>? _shifts;
+    private ICollection<TimeOffRequest>? _timeOff;
 
     public Staff() { }
 
@@ -41,10 +42,20 @@ public class Staff
     public string? UsualPattern { get; set; }
     public bool IsActive { get; set; } = true;
 
+    /// <summary>The ticket this role legally needs, e.g. RSA for bar staff.</summary>
+    public string? Certification { get; set; }
+    public DateOnly? CertificationExpires { get; set; }
+
     public ICollection<Shift> Shifts
     {
         get => LazyLoader.Load(this, ref _shifts) ?? (_shifts = new List<Shift>());
         set => _shifts = value;
+    }
+
+    public ICollection<TimeOffRequest> TimeOff
+    {
+        get => LazyLoader.Load(this, ref _timeOff) ?? (_timeOff = new List<TimeOffRequest>());
+        set => _timeOff = value;
     }
 
     public bool CanWork(Shift shift) => WhyCannotWork(shift) is null;
@@ -56,6 +67,8 @@ public class Staff
         if (!IsActive || CompanyId != shift.CompanyId) return "Not on the roster";
         if (!AvailableDays.HasFlag(Week.DayFlag(shift.Start.DayOfWeek)))
             return $"Unavailable on {shift.Start.DayOfWeek}s";
+        var day = DateOnly.FromDateTime(shift.Start);
+        if (TimeOff.Any(t => t.Status == RequestStatus.Approved && t.From <= day && t.To >= day)) return "On leave";
         if (!Stations.HasFlag(shift.Station)) return $"Not trained on {shift.Station}";
 
         var clash = Shifts.FirstOrDefault(s => s.Id != shift.Id && s.Start < shift.End && shift.Start < s.End);

@@ -11,6 +11,10 @@ public class Company
     public required string Accent { get; set; }
 
     public string Currency { get; set; } = "AUD";
+
+    /// <summary>IANA zone the venues trade in. Shift times are wall-clock in this zone.</summary>
+    public string TimeZone { get; set; } = "Australia/Brisbane";
+
     public List<Site> Sites { get; set; } = [];
 }
 
@@ -21,4 +25,21 @@ public class Site
     public int CompanyId { get; set; }
     public required string Name { get; set; }
     public decimal WeeklyBudget { get; set; }
+}
+
+public static class VenueClock
+{
+    /// <summary>Wall-clock "now" in a venue's zone, independent of the server's (UTC on Azure).</summary>
+    public static DateTime Now(string timeZone)
+    {
+        try
+        {
+            var zone = TimeZoneInfo.FindSystemTimeZoneById(timeZone);
+            return DateTime.SpecifyKind(TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, zone), DateTimeKind.Unspecified);
+        }
+        catch (TimeZoneNotFoundException)
+        {
+            return DateTime.SpecifyKind(DateTime.Now, DateTimeKind.Unspecified);
+        }
+    }
 }

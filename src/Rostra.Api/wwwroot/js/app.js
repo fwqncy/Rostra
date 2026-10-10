@@ -237,8 +237,10 @@ function toast(message, { action, onAction, tone, timeout = 5200 } = {}) {
   if (action) $('button', el).addEventListener('click', () => { dismiss(); onAction?.(); });
   $('#toasts').append(el);
   let timer = setTimeout(dismiss, timeout);
-  el.addEventListener('pointerenter', () => clearTimeout(timer));
-  el.addEventListener('pointerleave', () => { timer = setTimeout(dismiss, 2000); });
+  // Hovering or focusing the action (e.g. Undo) holds the toast open.
+  const action$ = $('button', el);
+  action$?.addEventListener('pointerenter', () => clearTimeout(timer));
+  action$?.addEventListener('pointerleave', () => { timer = setTimeout(dismiss, 2000); });
   el.addEventListener('focusin', () => clearTimeout(timer));
 }
 
@@ -334,6 +336,8 @@ const dialogHead = (title, sub) => html`
    -------------------------------------------------------------------------- */
 history.scrollRestoration = 'manual';
 const ROUTES = {
+  '/app/home': () => viewHome(),
+  '/app/dashboard': () => viewDashboard(),
   '/app/schedule': () => viewSchedule(),
   '/app/swaps': () => viewSwaps(),
   '/app/my-shifts': () => viewMyShifts(),
@@ -343,7 +347,7 @@ function navigate(url, { replace = false } = {}) {
   history[replace ? 'replaceState' : 'pushState']({ y: 0 }, '', url);
   route();
 }
-const defaultPath = () => (isManager() || !narrow.matches ? '/app/schedule' : '/app/my-shifts');
+const defaultPath = () => '/app/home';
 async function route() {
   const path = location.pathname.replace(/\/+$/, '') || '/';
   try {
@@ -406,8 +410,12 @@ function signedOut() {
 function navLinks() {
   const count = state.swaps.length;
   const badge = count ? html`<span class="badge" data-badge><span class="sr-only">, </span>${count}<span class="sr-only"> pending</span></span>` : '';
+  // Staff don't see the full roster: they get their own shifts, swaps and Home.
   return html`
-    <a href="/app/schedule${state.lastScheduleQuery}" data-nav="/app/schedule">${icon('calendar')}<span>Schedule</span></a>
+    <a href="/app/home" data-nav="/app/home">${icon('home')}<span>Home</span></a>
+    ${isManager() ? html`
+      <a href="/app/dashboard" data-nav="/app/dashboard">${icon('grid')}<span>Dashboard</span></a>
+      <a href="/app/schedule${state.lastScheduleQuery}" data-nav="/app/schedule">${icon('calendar')}<span>Schedule</span></a>` : ''}
     <a href="/app/swaps" data-nav="/app/swaps">${icon('swap')}<span>Swaps</span>${badge}</a>
     <a href="/app/my-shifts" data-nav="/app/my-shifts">${icon('clock')}<span>My Shifts</span></a>`;
 }
@@ -419,7 +427,7 @@ function ensureShell() {
   app.innerHTML = html`
     <div class="app">
       <aside class="sidebar" aria-label="Sidebar">
-        <a class="brand" href="/app/schedule" data-logo title="Right-click for brand assets">
+        <a class="brand" href="/app/home" data-logo title="Right-click for brand assets">
           <span class="brand-mark" aria-hidden="true">${initials(c.name)}</span>
           <span class="brand-text">
             <span class="brand-company" translate="no">${c.name}</span>
@@ -486,6 +494,10 @@ async function refreshQuietly() {
       rememberNames(state.schedule.staff);
     } else if (state.view === 'my-shifts') {
       state.myShifts = await api('/my-shifts');
+    } else if (state.view === 'dashboard') {
+      await loadDashboard();
+    } else if (state.view === 'home') {
+      state.home = await api('/home');
     }
     updateBadges();
     state.render?.();
@@ -504,6 +516,7 @@ function connectEvents() {
   let timer;
   const refresh = () => { clearTimeout(timer); timer = setTimeout(refreshQuietly, 250); };
   es.addEventListener('schedule.changed', refresh);
+  for (const type of ['clock', 'timeoff', 'revenue']) es.addEventListener(type, refresh);
   es.addEventListener('swap.requested', (e) => {
     const d = JSON.parse(e.data);
     refresh();
@@ -648,6 +661,7 @@ async function signIn(email, password, remember, button) {
    Schedule
    -------------------------------------------------------------------------- */
 async function viewSchedule() {
+  if (!isManager()) return navigate('/app/home', { replace: true });
   state.view = 'schedule';
   state.render = renderSchedule;
   const params = new URLSearchParams(location.search);
@@ -737,7 +751,7 @@ function renderSchedule() {
         ${manager ? html`<button type="button" class="btn btn-primary" data-action="new-shift">${icon('plus')}Add Shift…</button>` : ''}
       </div>
     </header>
-    ${manager ? managerStats(m) : staffStats(m)}
+    ${managerStats(m)}
     <section class="panel" aria-labelledby="roster-title">
       <h2 id="roster-title" class="sr-only">Roster for ${s.site.name}, week of ${fmt.dayLong.format(weekStart)}</h2>
       ${s.staff.length ? rosterTable(m) : html`
@@ -796,21 +810,6 @@ function managerStats({ s, total, perDay }) {
 }
 const weekDays = (s) => Array.from({ length: 7 }, (_, i) => addDays(parseDay(s.weekStart), i));
 
-function staffStats({ s, perPerson, total }) {
-  const me = state.me.id;
-  const mine = s.shifts.filter((x) => x.staffId === me).sort((a, b) => parse(a.start) - parse(b.start));
-  const next = mine.find((x) => parse(x.end) > new Date());
-  const myHours = perPerson.get(me)?.hours ?? mine.reduce((sum, x) => sum + paidHours(x), 0);
-  const requests = state.swaps.length;
-  return html`
-    <section class="stats" aria-label="Your week at a glance">
-      <div class="stat"><span class="stat-label">Your Hours</span><span class="stat-value">${hrs(myHours)}</span><span class="stat-foot">${fmt.int.format(mine.length)} shifts this week</span></div>
-      <div class="stat"><span class="stat-label">Next Shift</span><span class="stat-value">${next ? `${fmt.dow.format(parse(next.start))} ${compact(next.start, next.end)}` : '—'}</span><span class="stat-foot">${next ? `${next.station} · ${s.site.name}` : 'Nothing else this week'}</span></div>
-      <div class="stat"><span class="stat-label">Team on Roster</span><span class="stat-value">${fmt.int.format(s.staff.length)}</span><span class="stat-foot">${fmt.int.format(total.shifts)} shifts at ${s.site.name}</span></div>
-      <div class="stat"><span class="stat-label">Swap Requests</span><span class="stat-value">${fmt.int.format(requests)}</span><span class="stat-foot">${requests ? html`<a href="/app/swaps">View Requests</a>` : 'Tap one of your shifts to ask for cover'}</span></div>
-    </section>`;
-}
-
 function rosterTable({ s, days, cells, perPerson, perDay, total, people }) {
   const manager = isManager();
   const me = state.me.id;
@@ -840,7 +839,7 @@ function rosterTable({ s, days, cells, perPerson, perDay, total, people }) {
                   <span class="avatar ${isMe ? 'is-me' : ''}" aria-hidden="true">${initials(p.name)}</span>
                   <span class="person-text">
                     <span class="person-name">${p.name}${isMe ? html`<span class="you-tag">You</span>` : ''}</span>
-                    <span class="person-meta">${hrs(t.hours)}${manager ? ` · ${money(t.cost)}` : ` · ${p.title}`}</span>
+                    <span class="person-meta">${p.role === 'Manager' ? 'Manager · ' : ''}${hrs(t.hours)}${manager ? ` · ${money(t.cost)}` : ` · ${p.title}`}</span>
                   </span>
                 </div>
               </th>
@@ -1309,6 +1308,9 @@ function renderMyShifts() {
           const start = parse(s.start);
           const askedMe = s.pendingCoverId === me && s.staffId !== me;
           const pending = s.pendingCoverId != null;
+          const now = new Date();
+          const clockable = s.staffId === me && !s.clockOut
+            && now >= new Date(start.getTime() - 2 * 36e5) && now <= new Date(parse(s.end).getTime() + 2 * 36e5);
           return html`
             <article class="card ${pending ? 'is-pending' : ''}">
               <div class="card-date" aria-hidden="true"><small>${fmt.dow.format(start)}</small><strong>${fmt.dayNum.format(start)}</strong></div>
@@ -1322,8 +1324,10 @@ function renderMyShifts() {
                     : pending ? html`<span class="status is-pending">Waiting on ${s.pendingCoverName}</span>` : ''}
                 </span>
                 ${s.notes ? html`<span class="muted">${s.notes}</span>` : ''}
+                ${s.clockIn ? html`<span class="clock-state num">${icon('clock')}Clocked in ${fmt.time.format(parse(s.clockIn))}${s.clockOut ? ` · out ${fmt.time.format(parse(s.clockOut))}` : ''}</span>` : ''}
               </div>
               <div class="card-actions">
+                ${clockable ? html`<button type="button" class="btn btn-primary" data-action="clock" data-id="${s.id}">${icon('clock')}${s.clockIn ? 'Clock Out' : 'Clock In'}</button>` : ''}
                 ${askedMe ? html`<button type="button" class="btn btn-danger" data-action="decline" data-id="${s.id}">Decline</button>`
                   : pending ? html`<button type="button" class="btn" data-action="decline" data-id="${s.id}">Cancel Request</button>`
                   : html`<button type="button" class="btn" data-action="request-swap" data-id="${s.id}">${icon('swap')}Ask for Cover…</button>`}
@@ -1334,8 +1338,8 @@ function renderMyShifts() {
       <div class="empty">
         ${icon('calendar')}
         <h2>No Upcoming Shifts</h2>
-        <p>You’re not rostered on yet. Check the schedule to see what’s published.</p>
-        <a class="btn" href="/app/schedule">Go to Schedule</a>
+        <p>You’re not rostered on yet. New shifts appear here as soon as your manager adds them.</p>
+        <a class="btn" href="/app/home">Go to Home</a>
       </div>`}`.v;
 }
 
@@ -1365,6 +1369,18 @@ const actions = {
   },
 
   'new-shift': (el) => openShiftEditor({ returnTo: el }),
+
+  clock: async (el) => {
+    await withLoading(el, async () => {
+      try {
+        const punch = await api('/clock', { method: 'POST' });
+        toast(`Clocked ${punch.kind === 'In' ? 'in' : 'out'} at ${fmt.time.format(parse(punch.at))}.`);
+        state.myShifts = await api('/my-shifts');
+        renderMyShifts();
+        $(`[data-action="clock"][data-id="${el.dataset.id}"]`)?.focus();
+      } catch (e) { toast(e.message, { tone: 'error' }); }
+    });
+  },
 
   'add-shift': (el) => openShiftEditor({
     staffId: Number(el.dataset.staff), dayIndex: Number(el.dataset.day),
@@ -1475,6 +1491,1252 @@ document.addEventListener('change', (e) => {
   if (e.target.id === 'site-select' && state.schedule) {
     navigate(`/app/schedule?site=${e.target.value}&week=${state.schedule.weekStart}`);
   }
+});
+
+/* --------------------------------------------------------------------------
+   Dashboard (managers): tasks, who's in, time clock, wages, weekly planner
+   -------------------------------------------------------------------------- */
+const WIDGETS = {
+  tasks: 'What Should I Work On?',
+  who: 'Who’s In Today?',
+  feed: 'Live Time Clock Feed',
+  wages: 'Live Wage Tracker',
+  planner: 'Weekly Planner',
+};
+const HIDDEN_KEY = 'rostra.dash.hidden';
+const dash = { tasks: null, today: null, feed: null, wages: null, week: null, skew: 0, timer: null, observer: null };
+const rtf = new Intl.RelativeTimeFormat(locales, { numeric: 'auto' });
+const pct1 = new Intl.NumberFormat(locales, { style: 'percent', minimumFractionDigits: 1, maximumFractionDigits: 1 });
+const hourLabel = new Intl.DateTimeFormat(locales, { hour: 'numeric' });
+
+let hiddenWidgets = (() => {
+  try { return new Set(JSON.parse(localStorage.getItem(HIDDEN_KEY) || '[]').filter((k) => k in WIDGETS)); } catch { return new Set(); }
+})();
+const saveHidden = () => { try { localStorage.setItem(HIDDEN_KEY, JSON.stringify([...hiddenWidgets])); } catch { /* ignore */ } };
+
+/** Venue wall-clock time, from the server (venues can be in a different zone to this browser). */
+const venueNow = () => new Date(Date.now() + dash.skew);
+const syncClock = (serverNow) => { dash.skew = parse(serverNow) - Date.now(); };
+const siteName = (id) => state.me.sites.find((s) => s.id === id)?.name ?? '';
+const plural = (n, one, many) => `${fmt.int.format(n)} ${n === 1 ? one : many}`;
+const minutesBetween = (a, b) => Math.round((b - a) / 60000);
+function duration(ms) {
+  const mins = Math.max(0, Math.round(ms / 60000));
+  return `${Math.floor(mins / 60)}h${NBSP}${pad(mins % 60)}m`;
+}
+function relativeTime(date) {
+  const mins = minutesBetween(date, venueNow());
+  if (Math.abs(mins) < 60) return rtf.format(-mins, 'minute');
+  if (Math.abs(mins) < 60 * 24) return rtf.format(-Math.round(mins / 60), 'hour');
+  return rtf.format(-Math.round(mins / 1440), 'day');
+}
+const dateSpan = (from, to) => from === to
+  ? fmt.dayShort.format(parseDay(from))
+  : fmt.range.formatRange(parseDay(from), parseDay(to));
+
+/* URL-backed widget filters, so the dashboard deep-links and survives refresh. */
+function dashParams() {
+  const p = new URLSearchParams(location.search);
+  const home = String(state.me.homeSiteId);
+  return {
+    who: p.get('who') || home,
+    feed: p.get('feed') ?? '',
+    kinds: (p.get('kinds') ?? 'In,Out').split(',').filter(Boolean),
+    wsite: p.get('wsite') ?? home,
+    wdate: p.get('wdate') || '',
+    wst: p.get('wst') || '',
+    psite: p.get('psite') ?? home,
+    pweek: Number(p.get('pweek') || 0),
+    pmetric: p.get('pmetric') === 'hours' ? 'hours' : 'wages',
+    open: new Set((p.get('open') || '').split(',').filter(Boolean)),
+  };
+}
+function setDashParam(key, value) {
+  const p = new URLSearchParams(location.search);
+  if (value == null) p.delete(key); else p.set(key, value);
+  const qs = p.toString();
+  history.replaceState(history.state, '', `${location.pathname}${qs ? `?${qs}` : ''}`);
+}
+
+const siteOptions = (selected, allLabel) => html`
+  ${allLabel ? html`<option value="" ${selected === '' ? raw('selected') : ''}>${allLabel}</option>` : ''}
+  ${state.me.sites.map((s) => html`<option value="${s.id}" ${String(s.id) === selected ? raw('selected') : ''}>${s.name}</option>`)}`;
+const miniSelect = (id, label, options, key) => html`
+  <label class="mini-select" for="${id}"><span class="sr-only">${label}</span>
+    <select class="select select-sm" id="${id}" name="${key}" data-dash="${key}">${options}</select>
+  </label>`;
+
+function widget(id, tools, body) {
+  return html`
+    <section class="widget" id="w-${id}" data-widget="${id}" aria-labelledby="w-${id}-title" ${hiddenWidgets.has(id) ? raw('hidden') : ''}>
+      <header class="widget-head">
+        <h2 id="w-${id}-title">${id === 'wages' ? html`<span class="live-dot is-live" aria-hidden="true"></span>` : ''}${WIDGETS[id]}</h2>
+        <div class="widget-tools">
+          ${tools}
+          <button type="button" class="btn btn-ghost icon-btn btn-sm" data-action="hide-widget" data-widget="${id}" aria-label="Hide ${WIDGETS[id]}">${icon('eye-off')}</button>
+        </div>
+      </header>
+      <div class="error-banner widget-error" id="w-${id}-error" role="alert" hidden></div>
+      <div class="widget-body" id="w-${id}-body">${body}</div>
+    </section>`;
+}
+const skeletonRows = (n) => html`<div class="widget-skeleton" aria-busy="true" aria-label="Loading">${[...Array(n)].map(() => html`<span class="skeleton line"></span>`)}</div>`;
+
+async function viewDashboard() {
+  if (!isManager()) return navigate('/app/my-shifts', { replace: true });
+  state.view = 'dashboard';
+  state.render = null;
+  document.title = `Dashboard · ${state.me.company.name}`;
+  const p = dashParams();
+  const hour = new Date().getHours();
+  const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+
+  $('#content').innerHTML = html`
+    <header class="page-head">
+      <div class="page-title">
+        <h1>Dashboard</h1>
+        <p class="page-sub">${greeting}, ${state.me.name.split(' ')[0]} · ${fmt.dayLong.format(new Date())}</p>
+        <p class="hidden-note" id="hidden-note" aria-live="polite"></p>
+      </div>
+    </header>
+    <div class="dash">
+      ${widget('tasks', '', skeletonRows(4))}
+      ${widget('who', html`
+        ${miniSelect('who-site', 'Site', siteOptions(p.who), 'who')}
+        <a class="btn btn-ghost btn-sm" id="who-roster" href="/app/schedule?site=${p.who}">View Roster</a>`,
+        skeletonRows(8))}
+      ${widget('feed', html`
+        <button type="button" class="btn btn-sm" data-action="manual-punch">${icon('plus')}Add Punch…</button>
+        ${miniSelect('feed-site', 'Site', siteOptions(p.feed, 'All Sites'), 'feed')}`, html`
+        <div class="feed-filters">
+          <label class="search" for="feed-search">
+            <span class="sr-only">Search the time clock by name</span>${icon('search')}
+            <input class="input" id="feed-search" type="search" name="q" placeholder="Search by name…" autocomplete="off" spellcheck="false">
+          </label>
+          <fieldset class="kind-filter">
+            <legend class="sr-only">Show punches</legend>
+            <label class="check"><input type="checkbox" name="kind" value="In" ${p.kinds.includes('In') ? raw('checked') : ''}> In</label>
+            <label class="check"><input type="checkbox" name="kind" value="Out" ${p.kinds.includes('Out') ? raw('checked') : ''}> Out</label>
+          </fieldset>
+        </div>
+        <ul class="feed" id="feed-list" aria-live="polite" aria-relevant="additions">${skeletonRows(5)}</ul>`)}
+      ${widget('wages', html`
+        ${miniSelect('wage-site', 'Site', siteOptions(p.wsite, 'All Sites'), 'wsite')}
+        ${miniSelect('wage-station', 'Station', html`<option value="">All Stations</option>${STATIONS.map((s) => html`<option value="${s}" ${p.wst === s ? raw('selected') : ''}>${s}</option>`)}`, 'wst')}
+        <label class="mini-select" for="wage-date"><span class="sr-only">Day</span>
+          <input class="input input-sm num" type="date" id="wage-date" name="wdate" data-dash="wdate" value="${p.wdate}">
+        </label>
+        <button type="button" class="btn btn-sm" data-action="wage-today">Today</button>
+        <button type="button" class="btn btn-ghost icon-btn btn-sm" data-action="fullscreen" aria-pressed="false" aria-label="Full screen">${icon('maximize')}</button>`, html`
+        <div class="wt">
+          <div class="wt-stats" id="wt-stats">${skeletonRows(6)}</div>
+          <div class="wt-plot">
+            <div class="wt-chart" id="wt-chart"></div>
+            <details class="chart-table" id="wt-table"><summary>Show Data Table</summary><div id="wt-table-body"></div></details>
+          </div>
+        </div>`)}
+      ${widget('planner', html`
+        <button type="button" class="btn btn-sm" data-action="upload-revenue">${icon('upload')}Upload…</button>
+        ${miniSelect('plan-site', 'Site', siteOptions(p.psite, 'All Sites'), 'psite')}
+        ${miniSelect('plan-week', 'Week', html`${[[-1, 'Last Week'], [0, 'This Week'], [1, 'Next Week']].map(([v, l]) => html`<option value="${v}" ${p.pweek === v ? raw('selected') : ''}>${l}</option>`)}`, 'pweek')}
+        ${miniSelect('plan-metric', 'Show', html`<option value="wages" ${p.pmetric === 'wages' ? raw('selected') : ''}>Wages</option><option value="hours" ${p.pmetric === 'hours' ? raw('selected') : ''}>Hours</option>`, 'pmetric')}`,
+        skeletonRows(6))}
+    </div>`.v;
+
+  if (!p.wdate) $('#wage-date').value = ymd(new Date());
+  updateHiddenNote();
+  dash.observer?.disconnect();
+  dash.observer = new ResizeObserver(() => requestAnimationFrame(() => dash.wages && drawWageChart()));
+  dash.observer.observe($('#wt-chart'));
+
+  clearInterval(dash.timer);
+  dash.timer = setInterval(() => {
+    if (state.view !== 'dashboard') return clearInterval(dash.timer);
+    loadDashboard(['who', 'wages', 'tasks']);
+    renderFeed();
+  }, 60000);
+
+  await loadDashboard();
+}
+
+const LOADERS = {
+  tasks: async () => { dash.tasks = await api('/dashboard/tasks'); renderTasks(); },
+  who: async () => {
+    dash.today = await api(`/dashboard/today?siteId=${dashParams().who}`);
+    syncClock(dash.today.now);
+    renderToday();
+  },
+  feed: async () => {
+    const p = dashParams();
+    if (!p.kinds.length) { dash.feed = []; return renderFeed(); }
+    const q = new URLSearchParams();
+    if (p.feed) q.set('siteId', p.feed);
+    if (p.kinds.length === 1) q.set('kind', p.kinds[0]);
+    const term = $('#feed-search')?.value.trim();
+    if (term) q.set('q', term);
+    dash.feed = await api(`/clock/feed?${q}`);
+    renderFeed();
+  },
+  wages: async () => {
+    const p = dashParams();
+    const q = new URLSearchParams({ date: $('#wage-date')?.value || ymd(new Date()) });
+    if (p.wsite) q.set('siteId', p.wsite);
+    if (p.wst) q.set('station', p.wst);
+    $('#w-wages')?.classList.add('is-refreshing');
+    dash.wages = await api(`/dashboard/wages?${q}`);
+    syncClock(dash.wages.now);
+    $('#w-wages')?.classList.remove('is-refreshing');
+    renderWages();
+  },
+  planner: async () => {
+    const p = dashParams();
+    const week = ymd(addDays(startOfWeek(new Date()), p.pweek * 7));
+    const q = new URLSearchParams({ week });
+    if (p.psite) q.set('siteId', p.psite);
+    dash.week = await api(`/dashboard/week?${q}`);
+    renderWeek();
+  },
+};
+
+async function loadDashboard(only = Object.keys(LOADERS)) {
+  await Promise.all(only.filter((id) => !hiddenWidgets.has(id)).map(async (id) => {
+    const error = $(`#w-${id}-error`);
+    try {
+      await LOADERS[id]();
+      if (error) error.hidden = true;
+    } catch (e) {
+      if (e.status === 401 || !error) return;
+      error.innerHTML = html`${icon('alert')}<p>${e.message}</p><button type="button" class="btn btn-sm" data-action="reload-widget" data-widget="${id}">Try Again</button>`.v;
+      error.hidden = false;
+    }
+  }));
+}
+
+/** Re-rendering a widget the user is tabbing through would steal focus; wait for the next tick instead. */
+const busy = (el) => el?.contains(document.activeElement) && document.activeElement !== el && el.dataset.rendered;
+
+function updateHiddenNote() {
+  const note = $('#hidden-note');
+  if (!note) return;
+  note.innerHTML = hiddenWidgets.size
+    ? html`${plural(hiddenWidgets.size, 'widget hidden', 'widgets hidden')} · <button type="button" class="link-btn" data-action="show-widgets">Show All</button>`.v
+    : '';
+}
+
+/* ---------------------------- What should I work on? ---------------------------- */
+function renderTasks() {
+  const body = $('#w-tasks-body');
+  if (!body || !dash.tasks) return;
+  const t = dash.tasks;
+  const open = dashParams().open;
+  const items = [];
+
+  if (t.timeOff.length) items.push({
+    key: 'timeoff', icon: 'calendar-x', cta: 'Review Time-Off Requests',
+    title: `${plural(t.timeOff.length, 'time-off request needs', 'time-off requests need')} approval.`,
+    detail: t.timeOff.map((r) => html`
+      <li class="task-row">
+        <div class="task-row-text">
+          <strong>${r.name}</strong>
+          <span class="muted">${dateSpan(r.from, r.to)} · ${r.reason}</span>
+          ${r.rosteredShifts ? html`<span class="status is-cost">${icon('alert')}Rostered on ${plural(r.rosteredShifts, 'shift', 'shifts')}</span>` : ''}
+        </div>
+        <div class="task-row-actions">
+          <button type="button" class="btn btn-sm" data-action="timeoff" data-decision="decline" data-id="${r.id}">Decline</button>
+          <button type="button" class="btn btn-sm btn-primary" data-action="timeoff" data-decision="approve" data-id="${r.id}">Approve</button>
+        </div>
+      </li>`),
+  });
+  if (t.swaps) items.push({
+    key: 'swaps', icon: 'swap', href: '/app/swaps', cta: 'Review Swap Requests',
+    title: `${plural(t.swaps, 'shift swap needs', 'shift swaps need')} approval.`,
+  });
+  if (t.late.length) items.push({
+    key: 'late', icon: 'clock', cta: 'See Who',
+    title: `${plural(t.late.length, 'person hasn’t', 'people haven’t')} clocked in for their shift.`,
+    detail: t.late.map((l) => html`
+      <li class="task-row"><div class="task-row-text">
+        <strong>${l.name}</strong>
+        <span class="muted">${siteName(l.siteId)} · due ${fmt.time.format(parse(l.start))}</span>
+        <span class="status is-cost">${icon('alert')}${fmt.int.format(Math.max(0, minutesBetween(parse(l.start), venueNow())))}${NBSP}min late</span>
+      </div></li>`),
+  });
+  for (const w of t.nextWeek) {
+    const href = `/app/schedule?site=${w.siteId}&week=${t.nextWeekStart}`;
+    if (!w.shifts) items.push({ key: `empty-${w.siteId}`, icon: 'calendar', href, cta: 'Start Next Week’s Roster', title: `Next week’s roster at ${w.site} has no shifts yet.` });
+    else if (w.cost > w.budget) items.push({ key: `budget-${w.siteId}`, icon: 'dollar', href, cta: 'Open Next Week’s Roster', title: `Next week at ${w.site} is ${money(w.cost - w.budget)} over budget.` });
+  }
+  if (t.certifications.length) items.push({
+    key: 'certs', icon: 'badge', cta: 'Check Certifications',
+    title: `${plural(t.certifications.length, 'certification expires', 'certifications expire')} in the next month.`,
+    detail: t.certifications.map((c) => {
+      const days = Math.round((parseDay(c.expires) - parseDay(ymd(venueNow()))) / 864e5);
+      return html`
+        <li class="task-row"><div class="task-row-text">
+          <strong>${c.name}</strong>
+          <span class="muted">${c.certification} · ${c.site}</span>
+          <span class="status ${days < 0 ? 'is-danger' : 'is-cost'}">${days < 0 ? 'Expired' : `Expires ${rtf.format(days, 'day')}`} · ${fmt.dayShort.format(parseDay(c.expires))}</span>
+        </div></li>`;
+    }),
+  });
+
+  body.dataset.rendered = '1';
+  body.innerHTML = items.length
+    ? html`<ul class="tasks">${items.map((it) => html`
+        <li class="task">
+          <span class="task-icon" aria-hidden="true">${icon(it.icon)}</span>
+          <div class="task-body">
+            <p class="task-title">${it.title}</p>
+            ${it.href
+              ? html`<a class="task-link" href="${it.href}">${it.cta}${icon('right')}</a>`
+              : html`
+                <button type="button" class="task-link" data-action="toggle-task" data-key="${it.key}" aria-expanded="${open.has(it.key)}" aria-controls="task-${it.key}">${it.cta}${icon('down')}</button>
+                <ul class="task-detail" id="task-${it.key}" ${open.has(it.key) ? '' : raw('hidden')}>${it.detail}</ul>`}
+          </div>
+        </li>`)}</ul>`.v
+    : html`<div class="widget-empty">${icon('check')}<p><strong>You’re all caught up.</strong> New requests appear here the moment they arrive.</p></div>`.v;
+}
+
+/* ---------------------------- Who's in today? ---------------------------- */
+function renderToday() {
+  const body = $('#w-who-body');
+  if (!body || !dash.today || busy(body)) return;
+  const d = dash.today;
+  const now = parse(d.now);
+  const groups = { coming: [], atWork: [], finished: [], missed: [] };
+  for (const s of d.shifts) {
+    if (s.clockOut) groups.finished.push(s);
+    else if (s.clockIn) groups.atWork.push(s);
+    else if (parse(s.end) <= now) groups.missed.push(s);
+    else groups.coming.push(s);
+  }
+  groups.atWork.sort((a, b) => parse(a.clockIn) - parse(b.clockIn));
+  groups.finished.sort((a, b) => parse(b.clockOut) - parse(a.clockOut));
+  const open = dashParams().open;
+  const section = (key, title, list, empty) => {
+    if (!list.length && !empty) return '';
+    const all = open.has(`who-${key}`);
+    const shown = all ? list : list.slice(0, 6);
+    return html`
+      <section class="who-section" aria-labelledby="who-${key}">
+        <h3 class="who-head" id="who-${key}"><span class="num">${fmt.int.format(list.length)}</span> ${title}</h3>
+        ${list.length ? html`<ol class="who-list">${shown.map((s) => whoRow(s, now))}</ol>` : html`<p class="who-empty">${empty}</p>`}
+        ${list.length > 6 ? html`<button type="button" class="link-btn who-more" data-action="toggle-task" data-key="who-${key}" aria-expanded="${all}">${all ? 'Show Fewer' : `Show All ${fmt.int.format(list.length)}`}</button>` : ''}
+      </section>`;
+  };
+
+  $('#who-roster')?.setAttribute('href', `/app/schedule?site=${d.site.id}`);
+  body.dataset.rendered = '1';
+  body.innerHTML = d.shifts.length || d.onLeave.length ? html`
+    ${section('coming', 'Coming Up', groups.coming, 'Everyone due has started their shift.')}
+    ${section('atwork', 'At Work', groups.atWork, 'No one is clocked in right now.')}
+    ${section('finished', 'Finished', groups.finished)}
+    ${section('missed', 'Didn’t Clock In', groups.missed)}
+    <section class="who-section" aria-labelledby="who-leave">
+      <h3 class="who-head" id="who-leave"><span class="num">${fmt.int.format(d.onLeave.length)}</span> On Leave</h3>
+      ${d.onLeave.length ? html`<ul class="leave-list">${d.onLeave.map((l) => html`<li><span class="avatar" aria-hidden="true">${initials(l.name)}</span><span><strong>${l.name}</strong><span class="muted"> · ${l.reason}, back after ${fmt.dayShort.format(parseDay(l.to))}</span></span></li>`)}</ul>` : html`<p class="who-empty">No one is on leave today.</p>`}
+    </section>` : html`
+    <div class="widget-empty">${icon('calendar')}<p><strong>No one is rostered at ${d.site.name} today.</strong></p>
+      <a class="btn btn-sm" href="/app/schedule?site=${d.site.id}">Open the Roster</a></div>`;
+}
+
+function whoRow(s, now) {
+  const start = parse(s.start);
+  const end = parse(s.end);
+  let state, time, meta, pill = '';
+  if (s.clockOut) {
+    state = 'finished';
+    time = duration(parse(s.clockOut) - parse(s.clockIn));
+    meta = `${fmt.time.format(parse(s.clockIn))} – ${fmt.time.format(parse(s.clockOut))}`;
+  } else if (s.clockIn) {
+    state = 'atwork';
+    time = fmt.time.format(parse(s.clockIn));
+    meta = `${s.station} · until ${fmt.time.format(end)}`;
+    pill = html`<span class="status is-save">On for ${duration(now - parse(s.clockIn))}</span>`;
+  } else if (end <= now) {
+    state = 'missed';
+    time = fmt.time.format(start);
+    meta = `Rostered ${compact(s.start, s.end)}`;
+    pill = html`<span class="status is-danger">${icon('alert')}No punch</span>`;
+  } else if (start <= now) {
+    state = 'late';
+    time = fmt.time.format(start);
+    meta = `${s.station} · ${compact(s.start, s.end)}`;
+    pill = html`<span class="status is-cost">${icon('alert')}${fmt.int.format(minutesBetween(start, now))}${NBSP}min late</span>`;
+  } else {
+    state = 'upcoming';
+    time = fmt.time.format(start);
+    meta = `${s.station} · ${compact(s.start, s.end)}`;
+  }
+  return html`
+    <li class="who-row is-${state}">
+      <span class="who-time num">${time}</span>
+      <span class="who-node" aria-hidden="true"></span>
+      <div class="who-card" data-station="${s.station}">
+        <span class="station-dot" aria-hidden="true"></span>
+        <span class="who-text"><span class="who-name">${s.name}</span><span class="who-meta num">${meta}</span></span>
+        ${pill}
+      </div>
+    </li>`;
+}
+
+/* ---------------------------- Live time clock feed ---------------------------- */
+function renderFeed() {
+  const list = $('#feed-list');
+  if (!list || !dash.feed || busy(list)) return;
+  const p = dashParams();
+  const term = $('#feed-search')?.value.trim();
+  list.dataset.rendered = '1';
+  if (!p.kinds.length) {
+    list.innerHTML = html`<li class="widget-empty"><p>Tick <strong>In</strong> or <strong>Out</strong> to see punches.</p></li>`.v;
+    return;
+  }
+  if (!dash.feed.length) {
+    list.innerHTML = html`<li class="widget-empty">${icon('clock')}<p>${term ? `No punches match “${term}”.` : 'No punches yet. They appear here as staff clock in.'}</p></li>`.v;
+    return;
+  }
+  list.innerHTML = dash.feed.map((e) => {
+    const at = parse(e.at);
+    let note = '';
+    if (e.kind === 'In' && e.shiftStart) {
+      const late = minutesBetween(parse(e.shiftStart), at);
+      note = late > 5 ? html`<span class="status is-cost">${fmt.int.format(late)}${NBSP}min late</span>` : html`<span class="muted">On time</span>`;
+    } else if (e.kind === 'Out' && e.shiftEnd) {
+      const over = minutesBetween(parse(e.shiftEnd), at);
+      note = over > 5 ? html`<span class="muted">${fmt.int.format(over)}${NBSP}min over</span>` : '';
+    }
+    return html`
+      <li class="feed-item">
+        <span class="avatar" aria-hidden="true">${initials(e.name)}</span>
+        <div class="feed-text">
+          <p class="feed-who"><strong>${e.name}</strong> <span class="muted">${e.site}</span></p>
+          <p class="feed-when">
+            <span class="status ${e.kind === 'In' ? 'is-save' : ''}">${e.kind === 'In' ? 'In' : 'Out'}</span>
+            <time class="feed-clock num" datetime="${e.at}">${fmt.time.format(at)}</time>
+            <span class="muted">${relativeTime(at)}</span>
+            ${note}
+          </p>
+          ${e.source === 'Manager' ? html`<p class="muted feed-source">Added by a manager</p>` : ''}
+        </div>
+      </li>`.v;
+  }).join('');
+}
+
+/* ---------------------------- Live wage tracker ---------------------------- */
+function renderWages() {
+  const stats = $('#wt-stats');
+  const w = dash.wages;
+  if (!stats || !w) return;
+  const v = w.soFar;
+  const variance = (actual, planned, format) => {
+    const diff = actual - planned;
+    const ratio = planned ? Math.abs(diff) / planned : 0;
+    if (Math.abs(diff) < 0.005 * Math.max(planned, 1)) return html`<dd class="num">On plan</dd>`;
+    return html`<dd class="num ${diff > 0 ? 'is-over' : 'is-under'}">${diff > 0 ? '+' : '−'}${format(Math.abs(diff))} (${pct1.format(ratio)}) ${diff > 0 ? 'over' : 'under'}</dd>`;
+  };
+  const date = parseDay(w.date);
+  stats.innerHTML = html`
+    <p class="wt-label">${w.isToday ? 'Day So Far' : w.isFuture ? `Rostered · ${fmt.dayShort.format(date)}` : fmt.dayShort.format(date)}</p>
+    ${w.isFuture ? html`
+      <dl class="wt-group">
+        <div class="wt-big"><dt>Rostered Cost</dt><dd class="num">${money(w.day.rosteredCost)}</dd></div>
+        <div class="wt-row"><dt>Rostered Hours</dt><dd class="num">${hrs(w.day.rosteredHours)}</dd></div>
+        <div class="wt-row"><dt>Shifts</dt><dd class="num">${fmt.int.format(w.day.shifts)}</dd></div>
+      </dl>` : html`
+      <dl class="wt-group">
+        <div class="wt-big"><dt>Wage Cost</dt><dd class="num">${money(v.actualCost)}</dd></div>
+        <div class="wt-row"><dt>Rostered</dt><dd class="num">${money(v.rosteredCost)}</dd></div>
+        <div class="wt-row"><dt>Variance</dt>${variance(v.actualCost, v.rosteredCost, money)}</div>
+      </dl>
+      <dl class="wt-group">
+        <div class="wt-big"><dt>Worked Hours</dt><dd class="num">${hrs(v.actualHours)}</dd></div>
+        <div class="wt-row"><dt>Rostered</dt><dd class="num">${hrs(v.rosteredHours)}</dd></div>
+        <div class="wt-row"><dt>Variance</dt>${variance(v.actualHours, v.rosteredHours, hrs)}</div>
+      </dl>
+      <p class="muted wt-foot">Whole day rostered: <span class="num">${money(w.day.rosteredCost)} · ${hrs(w.day.rosteredHours)}</span></p>`}
+    <ul class="wt-legend" aria-label="Chart legend">
+      ${w.isFuture ? '' : html`<li><span class="key key-actual" aria-hidden="true"></span>Staff on shift</li>`}
+      <li><span class="key key-rostered" aria-hidden="true"></span>Rostered</li>
+    </ul>`.v;
+  drawWageChart();
+  renderWageTable();
+}
+
+function wagePoints() {
+  return dash.wages.points.map((p) => ({ t: parse(p.t), r: p.rostered, a: p.actual }));
+}
+
+function renderWageTable() {
+  const el = $('#wt-table-body');
+  if (!el) return;
+  const pts = wagePoints().filter((p) => p.t.getMinutes() === 0);
+  el.innerHTML = pts.length ? html`
+    <table class="data-table">
+      <thead><tr><th scope="col">Time</th><th scope="col">On shift</th><th scope="col">Rostered</th></tr></thead>
+      <tbody>${pts.map((p) => html`<tr><th scope="row">${fmt.time.format(p.t)}</th><td class="num">${p.a ?? '—'}</td><td class="num">${p.r}</td></tr>`)}</tbody>
+    </table>`.v : '';
+}
+
+function drawWageChart() {
+  const el = $('#wt-chart');
+  const w = dash.wages;
+  if (!el || !w) return;
+  const pts = wagePoints();
+  if (!pts.length) {
+    el.innerHTML = html`<div class="widget-empty">${icon('calendar')}<p>No shifts are rostered${$('#wage-station')?.value ? ' for this station' : ''} on this day.</p></div>`.v;
+    return;
+  }
+  const width = Math.max(260, el.clientWidth);
+  const height = Math.max(200, el.clientHeight || 250);
+  const m = { l: 34, r: 18, t: 26, b: 26 };
+  const iw = width - m.l - m.r;
+  const ih = height - m.t - m.b;
+  const t0 = pts[0].t.getTime();
+  const t1 = pts.at(-1).t.getTime();
+  const x = (t) => m.l + ((t - t0) / (t1 - t0 || 1)) * iw;
+  const peak = Math.max(1, ...pts.map((p) => Math.max(p.r, p.a ?? 0)));
+  const step = peak <= 6 ? 1 : peak <= 12 ? 2 : peak <= 30 ? 5 : 10;
+  const yMax = Math.ceil(peak / step) * step;
+  const y = (v) => m.t + ih - (v / yMax) * ih;
+  const cutoff = parse(w.cutoff).getTime();
+
+  const stepPath = (key) => {
+    let d = '';
+    let lastX = null;
+    for (const p of pts) {
+      const v = p[key];
+      if (v == null) break;
+      const px = x(p.t.getTime()).toFixed(1);
+      const py = y(v).toFixed(1);
+      d += d ? `H${px}V${py}` : `M${px},${py}`;
+      lastX = px;
+    }
+    // Hold the live line flat up to "now" rather than stopping at the last 15-minute sample.
+    if (key === 'a' && d && w.isToday && cutoff > t0 && cutoff < t1) d += `H${x(cutoff).toFixed(1)}`;
+    return { d, lastX };
+  };
+  const rostered = stepPath('r');
+  const actual = w.isFuture ? { d: '' } : stepPath('a');
+
+  const yTicks = [];
+  for (let v = 0; v <= yMax; v += step) yTicks.push(v);
+  const spanHours = (t1 - t0) / 36e5;
+  const every = spanHours > 12 ? 3 : spanHours > 6 ? 2 : 1;
+  const xTicks = [];
+  for (let t = new Date(t0); t.getTime() <= t1; t = new Date(t.getTime() + 36e5)) {
+    if (t.getMinutes() === 0 && t.getHours() % every === 0) xTicks.push(new Date(t));
+  }
+  const lastActual = [...pts].reverse().find((p) => p.a != null);
+  const showNow = w.isToday && cutoff >= t0 && cutoff <= t1;
+  const peakActual = Math.max(0, ...pts.map((p) => p.a ?? 0));
+
+  el.innerHTML = html`
+    <svg class="wt-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img"
+         aria-label="Staff on shift compared with rostered, ${fmt.dayLong.format(parseDay(w.date))}. Peak ${peakActual} on shift, ${Math.max(...pts.map((p) => p.r))} rostered.">
+      <text class="axis-title" x="${m.l - 26}" y="12">Staff</text>
+      ${yTicks.map((v) => html`
+        <line class="grid-line" x1="${m.l}" x2="${width - m.r}" y1="${y(v)}" y2="${y(v)}"></line>
+        <text class="axis-label" x="${m.l - 8}" y="${y(v) + 4}" text-anchor="end">${v}</text>`)}
+      ${xTicks.map((t) => html`<text class="axis-label" x="${x(t.getTime())}" y="${height - 6}" text-anchor="middle">${hourLabel.format(t)}</text>`)}
+      <path class="line-rostered" d="${rostered.d}"></path>
+      ${actual.d ? html`<path class="line-actual" d="${actual.d}"></path>` : ''}
+      ${showNow ? html`
+        <line class="now-line" x1="${x(cutoff)}" x2="${x(cutoff)}" y1="${m.t - 6}" y2="${m.t + ih}"></line>
+        <text class="now-label" x="${Math.min(x(cutoff), width - m.r - 4)}" y="${m.t - 10}" text-anchor="${x(cutoff) > width - 90 ? 'end' : 'middle'}">Now ${fmt.time.format(new Date(cutoff))}</text>` : ''}
+      ${lastActual && !w.isFuture ? html`<text class="direct-label" x="${Math.min(x(showNow ? cutoff : lastActual.t.getTime()) + 6, width - m.r)}" y="${y(lastActual.a) - 6}" text-anchor="${(showNow ? x(cutoff) : x(lastActual.t.getTime())) > width - 70 ? 'end' : 'start'}">${lastActual.a} on shift</text>` : ''}
+      <g class="hover-layer" hidden>
+        <line class="crosshair" y1="${m.t}" y2="${m.t + ih}"></line>
+        <circle class="dot-rostered" r="4"></circle>
+        <circle class="dot-actual" r="4"></circle>
+      </g>
+      <rect class="hit" x="${m.l}" y="${m.t}" width="${iw}" height="${ih}" tabindex="0" focusable="true"
+            aria-label="Explore the chart. Use the left and right arrow keys to move through the day."></rect>
+    </svg>
+    <div class="chart-tip" role="status" hidden></div>`.v;
+
+  const svg = $('svg', el);
+  const layer = $('.hover-layer', svg);
+  const tip = $('.chart-tip', el);
+  const hit = $('.hit', svg);
+  let index = lastActual ? pts.indexOf(lastActual) : 0;
+  const show = (i) => {
+    index = Math.max(0, Math.min(pts.length - 1, i));
+    const p = pts[index];
+    const px = x(p.t.getTime());
+    layer.hidden = false;
+    $('.crosshair', layer).setAttribute('x1', px);
+    $('.crosshair', layer).setAttribute('x2', px);
+    const dr = $('.dot-rostered', layer);
+    dr.setAttribute('cx', px); dr.setAttribute('cy', y(p.r));
+    const da = $('.dot-actual', layer);
+    da.style.setProperty('display', p.a == null ? 'none' : '');
+    if (p.a != null) { da.setAttribute('cx', px); da.setAttribute('cy', y(p.a)); }
+    tip.innerHTML = html`
+      <p class="tip-time">${fmt.time.format(p.t)}</p>
+      ${p.a != null ? html`<p class="tip-row"><span class="key key-actual" aria-hidden="true"></span><strong class="num">${p.a}</strong><span>on shift</span></p>` : ''}
+      <p class="tip-row"><span class="key key-rostered" aria-hidden="true"></span><strong class="num">${p.r}</strong><span>rostered</span></p>`.v;
+    tip.hidden = false;
+    const tipWidth = tip.offsetWidth;
+    tip.style.setProperty('left', `${Math.max(4, px + 12 + tipWidth > width ? px - tipWidth - 12 : px + 12)}px`);
+    tip.style.setProperty('top', `${m.t}px`);
+  };
+  const hide = () => { layer.hidden = true; tip.hidden = true; };
+  hit.addEventListener('pointermove', (e) => {
+    const box = svg.getBoundingClientRect();
+    const t = t0 + ((e.clientX - box.left - m.l) / iw) * (t1 - t0);
+    let best = 0;
+    pts.forEach((p, i) => { if (Math.abs(p.t - t) < Math.abs(pts[best].t - t)) best = i; });
+    show(best);
+  });
+  hit.addEventListener('pointerleave', () => { if (document.activeElement !== hit) hide(); });
+  hit.addEventListener('focus', () => show(index));
+  hit.addEventListener('blur', hide);
+  hit.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') { e.preventDefault(); show(index + (e.key === 'ArrowRight' ? 1 : -1)); }
+    else if (e.key === 'Home') { e.preventDefault(); show(0); }
+    else if (e.key === 'End') { e.preventDefault(); show(pts.length - 1); }
+    else if (e.key === 'Escape') hide();
+  });
+}
+
+/* ---------------------------- Weekly planner ---------------------------- */
+function renderWeek() {
+  const body = $('#w-planner-body');
+  if (!body || !dash.week) return;
+  const hoursMode = dashParams().pmetric === 'hours';
+  const days = dash.week.days;
+  const done = (d) => d.actualCost != null && !d.isToday;
+  const planned = (d) => (hoursMode ? d.rosteredHours : d.rosteredCost);
+  const actual = (d) => (hoursMode ? d.actualHours : d.actualCost);
+  const show = (n) => (hoursMode ? hrs(n) : money(n));
+  const signed = (n) => `${n > 0.004 ? '+' : n < -0.004 ? '−' : ''}${show(Math.abs(n))}`;
+  const ratio = (cost, hours, revenue) => {
+    if (hoursMode) return hours ? money(revenue / hours) : '—';
+    return revenue ? pct1.format(cost / revenue) : '—';
+  };
+  const sum = (list, f) => list.reduce((s, d) => s + (f(d) ?? 0), 0);
+  const completed = days.filter(done);
+  const started = days.filter((d) => d.actualCost != null);
+  const withRevenue = days.filter((d) => d.actualRevenue != null && done(d));
+  const totalVariance = sum(completed, actual) - sum(completed, planned);
+  const today = days.find((d) => d.isToday);
+
+  body.innerHTML = html`
+    <div class="planner-scroll" role="region" aria-label="Weekly planner, week of ${fmt.dayLong.format(parseDay(dash.week.weekStart))}" tabindex="0">
+      <table class="planner">
+        <thead><tr>
+          <th scope="col"><span class="sr-only">Measure</span></th>
+          ${days.map((d) => html`<th scope="col" class="${d.isToday ? 'is-today' : ''}" ${d.isToday ? raw('aria-current="date"') : ''} aria-label="${fmt.dayLong.format(parseDay(d.date))}">${fmt.dow.format(parseDay(d.date))}<small>${fmt.dayNum.format(parseDay(d.date))}</small></th>`)}
+          <th scope="col" class="total">Total</th>
+        </tr></thead>
+        <tbody>
+          <tr><th scope="row">Roster</th>
+            ${days.map((d) => html`<td class="num ${d.isToday ? 'is-today' : ''}">${show(planned(d))}</td>`)}
+            <td class="num total">${show(sum(days, planned))}</td></tr>
+          <tr><th scope="row">Actual</th>
+            ${days.map((d) => html`<td class="num ${d.isToday ? 'is-today' : ''}">${actual(d) == null ? html`<span class="muted">—</span>` : html`${show(actual(d))}${d.isToday ? html`<span aria-hidden="true">*</span><span class="sr-only"> so far</span>` : ''}`}</td>`)}
+            <td class="num total">${started.length ? html`${show(sum(started, actual))}${today?.actualCost != null ? raw('<span aria-hidden="true">*</span>') : ''}` : '—'}</td></tr>
+          <tr class="group-end"><th scope="row">Variance</th>
+            ${days.map((d) => {
+              if (!done(d)) return html`<td class="num ${d.isToday ? 'is-today' : ''}"><span class="muted">—</span></td>`;
+              const diff = actual(d) - planned(d);
+              return html`<td class="num ${diff > 0 ? 'is-over' : 'is-under'}">${signed(diff)}</td>`;
+            })}
+            <td class="num total ${completed.length ? (totalVariance > 0 ? 'is-over' : 'is-under') : ''}">${completed.length ? signed(totalVariance) : '—'}</td></tr>
+          <tr><th scope="row">Revenue</th>
+            ${days.map((d) => html`<td class="num ${d.isToday ? 'is-today' : ''}">${d.actualRevenue != null ? money(d.actualRevenue) : html`<span class="muted">—</span>`}</td>`)}
+            <td class="num total">${withRevenue.length ? money(sum(withRevenue, (d) => d.actualRevenue)) : '—'}</td></tr>
+          <tr class="is-forecast group-end"><th scope="row">Forecast</th>
+            ${days.map((d) => html`<td class="num ${d.isToday ? 'is-today' : ''}">${money(d.forecastRevenue)}</td>`)}
+            <td class="num total">${money(sum(days, (d) => d.forecastRevenue))}</td></tr>
+          <tr><th scope="row">${hoursMode ? 'Sales per Labour Hour' : 'Wage % of Revenue'}</th>
+            ${days.map((d) => html`<td class="num ${d.isToday ? 'is-today' : ''}">${done(d) && d.actualRevenue != null ? ratio(d.actualCost, d.actualHours, d.actualRevenue) : html`<span class="muted">—</span>`}</td>`)}
+            <td class="num total">${withRevenue.length ? ratio(sum(withRevenue, (d) => d.actualCost), sum(withRevenue, (d) => d.actualHours), sum(withRevenue, (d) => d.actualRevenue)) : '—'}</td></tr>
+          <tr class="is-forecast"><th scope="row">Forecast</th>
+            ${days.map((d) => html`<td class="num ${d.isToday ? 'is-today' : ''}">${ratio(d.rosteredCost, d.rosteredHours, d.forecastRevenue)}</td>`)}
+            <td class="num total">${ratio(sum(days, (d) => d.rosteredCost), sum(days, (d) => d.rosteredHours), sum(days, (d) => d.forecastRevenue))}</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="planner-note muted">${today ? '* Today so far. ' : ''}Variance and actual ratios cover completed days. Weekend rates (Sat ×${state.penalties.saturday}, Sun ×${state.penalties.sunday}) are included.</p>`.v;
+}
+
+/* ---------------------------- Dialogs ---------------------------- */
+function openManualPunch(returnTo) {
+  const d = dash.today;
+  const shifts = (d?.shifts ?? []).filter((s) => !s.clockOut);
+  const now = venueNow();
+  const nextKind = (s) => (s?.clockIn ? 'Out' : 'In');
+  openDialog(html`
+    <form class="dialog-form" id="punch-form" novalidate data-track-changes>
+      ${dialogHead('Add a Punch', d ? `For someone at ${d.site.name} who couldn’t use the clock.` : '')}
+      <div class="dialog-body">
+        ${shifts.length ? html`
+          <div class="field">
+            <label for="p-staff">Team Member</label>
+            <select class="select" id="p-staff" name="staffId" data-field="staffId" data-autofocus>
+              ${shifts.map((s) => html`<option value="${s.staffId}" data-kind="${nextKind(s)}">${s.name} — ${compact(s.start, s.end)}${s.clockIn ? ' (clocked in)' : ''}</option>`)}
+            </select>
+            ${errorSlot('staffId', 'p-staff-error')}
+          </div>
+          <fieldset class="options">
+            <legend>Punch</legend>
+            <div class="row-2">
+              <label class="option"><input type="radio" name="kind" value="In" data-field="kind" ${nextKind(shifts[0]) === 'In' ? raw('checked') : ''}><span class="option-text"><strong>Clock In</strong></span></label>
+              <label class="option"><input type="radio" name="kind" value="Out" ${nextKind(shifts[0]) === 'Out' ? raw('checked') : ''}><span class="option-text"><strong>Clock Out</strong></span></label>
+            </div>
+            ${errorSlot('kind', 'p-kind-error')}
+          </fieldset>
+          <div class="field">
+            <label for="p-time">Time</label>
+            <input class="input num" id="p-time" name="time" type="time" step="60" value="${timeValue(now)}" data-field="at">
+            <p class="field-hint">Today, ${fmt.dayLong.format(now)}.</p>
+            ${errorSlot('at', 'p-time-error')}
+          </div>
+          <p class="form-error" data-error-for="_" role="alert" hidden tabindex="-1"></p>` : html`
+          <p class="muted">Everyone rostered at ${d?.site.name ?? 'this site'} today has already clocked out, or no one is rostered. Add their shift on the schedule first.</p>`}
+      </div>
+      <div class="dialog-foot"><span class="spacer"></span>
+        <button type="button" class="btn" data-close>Cancel</button>
+        ${shifts.length ? html`<button type="submit" class="btn btn-primary">Save Punch</button>` : ''}
+      </div>
+    </form>`, { returnTo });
+
+  const form = $('#punch-form', dialog);
+  if (!shifts.length) return;
+  form.staffId.addEventListener('change', () => {
+    const kind = form.staffId.selectedOptions[0].dataset.kind;
+    form.querySelector(`input[name="kind"][value="${kind}"]`).checked = true;
+  });
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    clearErrors(form);
+    if (!form.time.value) return showErrors(form, { at: 'Enter the time they started or finished.' });
+    const [hh, mm] = form.time.value.split(':').map(Number);
+    const at = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hh, mm);
+    const kind = form.querySelector('input[name="kind"]:checked').value;
+    await withLoading(e.submitter, async () => {
+      try {
+        await api('/clock/manual', { method: 'POST', body: { staffId: Number(form.staffId.value), kind, at: isoLocal(at) } });
+        const name = shifts.find((s) => s.staffId === Number(form.staffId.value))?.name;
+        closeDialog({ force: true });
+        toast(`${name} clocked ${kind === 'In' ? 'in' : 'out'} at ${fmt.time.format(at)}.`);
+        loadDashboard(['who', 'feed', 'wages', 'planner', 'tasks']);
+      } catch (err) {
+        if (err.errors) return showErrors(form, fromServer(err.errors));
+        const general = $('[data-error-for="_"]', form);
+        general.innerHTML = html`${icon('alert')}<span>${err.message}</span>`.v;
+        general.hidden = false;
+        general.focus();
+      }
+    });
+  });
+}
+
+function parseRevenueCsv(text) {
+  const lines = text.replace(/^﻿/, '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const errors = [];
+  if (!lines.length) return { rows: [], errors: ['The file is empty. Export a CSV with a date column and a forecast or actual column.'] };
+  const cells = (line) => line.split(',').map((c) => c.trim().replace(/^"(.*)"$/, '$1'));
+  let header = cells(lines[0]).map((h) => h.toLowerCase());
+  let first = 1;
+  if (!header.includes('date')) { header = ['date', 'forecast', 'actual']; first = 0; }
+  const col = {
+    date: header.indexOf('date'),
+    forecast: header.findIndex((h) => h.startsWith('forecast')),
+    actual: header.findIndex((h) => h.startsWith('actual') || h === 'revenue' || h === 'sales'),
+  };
+  if (col.forecast < 0 && col.actual < 0) return { rows: [], errors: ['Add a “forecast” or “actual” column next to “date”.'] };
+  const toDate = (s) => {
+    let m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+    m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/); // DD/MM/YYYY, as Australian POS exports write it
+    return m ? `${m[3]}-${pad(m[2])}-${pad(m[1])}` : null;
+  };
+  const toNumber = (s) => {
+    const clean = (s ?? '').replace(/[$\s,]/g, '');
+    if (!clean) return null;
+    const n = Number(clean);
+    return Number.isFinite(n) ? n : NaN;
+  };
+  const rows = [];
+  lines.slice(first).forEach((line, i) => {
+    const c = cells(line);
+    const lineNo = i + first + 1;
+    const date = toDate(c[col.date] ?? '');
+    if (!date) return errors.push(`Line ${lineNo}: “${c[col.date] ?? ''}” isn’t a date. Use 2026-10-05 or 05/10/2026.`);
+    const forecast = col.forecast >= 0 ? toNumber(c[col.forecast]) : null;
+    const actual = col.actual >= 0 ? toNumber(c[col.actual]) : null;
+    if (Number.isNaN(forecast) || Number.isNaN(actual)) return errors.push(`Line ${lineNo}: amounts must be plain numbers, like 4520.50.`);
+    if (forecast == null && actual == null) return;
+    rows.push({ date, forecast, actual });
+  });
+  return { rows, errors };
+}
+
+function openRevenueUpload(returnTo) {
+  const p = dashParams();
+  const siteId = p.psite || String(state.me.homeSiteId);
+  openDialog(html`
+    <form class="dialog-form" id="revenue-form" novalidate data-track-changes>
+      ${dialogHead('Upload Revenue', 'Add forecast or actual takings from your POS export.')}
+      <div class="dialog-body">
+        <div class="field">
+          <label for="rv-site">Site</label>
+          <select class="select" id="rv-site" name="siteId" data-field="siteId">${siteOptions(siteId)}</select>
+          ${errorSlot('siteId', 'rv-site-error')}
+        </div>
+        <div class="field">
+          <label for="rv-file">CSV File</label>
+          <input class="input" id="rv-file" name="file" type="file" accept=".csv,text/csv" data-field="file" data-autofocus>
+          <p class="field-hint">Columns: <code translate="no">date,forecast,actual</code>. Dates like <code translate="no">2026-10-05</code> or <code translate="no">05/10/2026</code>. Leave a cell empty to keep what’s there.</p>
+          ${errorSlot('file', 'rv-file-error')}
+        </div>
+        <p class="muted" id="rv-summary" aria-live="polite"></p>
+        <a class="task-link" id="rv-template" href="#" download="rostra-revenue-template.csv">${icon('down')}Download a Template for This Week</a>
+        <p class="form-error" data-error-for="_" role="alert" hidden tabindex="-1"></p>
+      </div>
+      <div class="dialog-foot"><span class="spacer"></span>
+        <button type="button" class="btn" data-close>Cancel</button>
+        <button type="submit" class="btn btn-primary">${icon('upload')}Upload Revenue</button>
+      </div>
+    </form>`, { returnTo });
+
+  const form = $('#revenue-form', dialog);
+  const days = dash.week?.days ?? [];
+  const template = ['date,forecast,actual', ...days.map((d) => `${d.date},${d.forecastRevenue.toFixed(2)},${d.actualRevenue != null ? d.actualRevenue.toFixed(2) : ''}`)].join('\n');
+  const url = URL.createObjectURL(new Blob([template + '\n'], { type: 'text/csv' }));
+  $('#rv-template', form).href = url;
+  dialog.addEventListener('close', () => URL.revokeObjectURL(url), { once: true });
+
+  let parsed = null;
+  form.file.addEventListener('change', async () => {
+    clearErrors(form);
+    const file = form.file.files[0];
+    parsed = file ? parseRevenueCsv(await file.text()) : null;
+    $('#rv-summary', form).textContent = parsed
+      ? `${plural(parsed.rows.length, 'day', 'days')} ready to upload${parsed.errors.length ? `, ${plural(parsed.errors.length, 'line', 'lines')} skipped` : ''}.`
+      : '';
+    if (parsed?.errors.length) showErrors(form, { file: parsed.errors.slice(0, 3).join(' ') });
+  });
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    clearErrors(form);
+    if (!parsed) return showErrors(form, { file: 'Choose a CSV file to upload.' });
+    if (!parsed.rows.length) return showErrors(form, { file: parsed.errors[0] || 'No rows with amounts were found in that file.' });
+    await withLoading(e.submitter, async () => {
+      try {
+        const site = Number(form.siteId.value);
+        await api('/revenue', { method: 'POST', body: { siteId: site, rows: parsed.rows } });
+        closeDialog({ force: true });
+        toast(`Updated revenue for ${plural(parsed.rows.length, 'day', 'days')} at ${siteName(site)}.`);
+        loadDashboard(['planner']);
+      } catch (err) {
+        if (err.errors) return showErrors(form, fromServer({ ...err.errors, file: err.errors.rows }));
+        const general = $('[data-error-for="_"]', form);
+        general.innerHTML = html`${icon('alert')}<span>${err.message}</span>`.v;
+        general.hidden = false;
+        general.focus();
+      }
+    });
+  });
+}
+
+/* ---------------------------- Dashboard controls ---------------------------- */
+const RELOAD_FOR = { who: ['who'], feed: ['feed'], wsite: ['wages'], wst: ['wages'], wdate: ['wages'], psite: ['planner'], pweek: ['planner'], pmetric: [] };
+document.addEventListener('change', (e) => {
+  if (state.view !== 'dashboard') return;
+  const key = e.target.dataset.dash;
+  if (key) {
+    const value = e.target.value;
+    setDashParam(key, key === 'wdate' && value === ymd(new Date()) ? null : value);
+    if (key === 'pmetric') return renderWeek();
+    loadDashboard(RELOAD_FOR[key]);
+  } else if (e.target.name === 'kind' && e.target.closest('.kind-filter')) {
+    const kinds = $$('.kind-filter input:checked').map((i) => i.value);
+    setDashParam('kinds', kinds.join(','));
+    loadDashboard(['feed']);
+  }
+});
+let feedSearchTimer;
+document.addEventListener('input', (e) => {
+  if (e.target.id !== 'feed-search') return;
+  clearTimeout(feedSearchTimer);
+  feedSearchTimer = setTimeout(() => loadDashboard(['feed']), 220);
+});
+document.addEventListener('fullscreenchange', () => {
+  const button = $('[data-action="fullscreen"]');
+  if (!button) return;
+  const on = document.fullscreenElement?.id === 'w-wages';
+  button.setAttribute('aria-pressed', String(on));
+  button.setAttribute('aria-label', on ? 'Exit full screen' : 'Full screen');
+});
+
+Object.assign(actions, {
+  'reload-widget': (el) => loadDashboard([el.dataset.widget]),
+  'manual-punch': (el) => openManualPunch(el),
+  'upload-revenue': (el) => openRevenueUpload(el),
+  'wage-today': () => {
+    $('#wage-date').value = ymd(new Date());
+    setDashParam('wdate', null);
+    loadDashboard(['wages']);
+  },
+  fullscreen: () => {
+    const el = $('#w-wages');
+    if (document.fullscreenElement) document.exitFullscreen();
+    else el?.requestFullscreen?.().catch(() => toast('Full screen isn’t available in this browser.', { tone: 'error' }));
+  },
+  'toggle-task': (el) => {
+    const open = dashParams().open;
+    const key = el.dataset.key;
+    if (open.has(key)) open.delete(key); else open.add(key);
+    setDashParam('open', open.size ? [...open].join(',') : null);
+    if (key.startsWith('who-')) {
+      delete $('#w-who-body').dataset.rendered;
+      renderToday();
+      $(`[data-key="${key}"]`)?.focus();
+      return;
+    }
+    el.setAttribute('aria-expanded', String(open.has(key)));
+    $(`#task-${key}`).hidden = !open.has(key);
+  },
+  'hide-widget': (el) => {
+    const id = el.dataset.widget;
+    hiddenWidgets.add(id);
+    saveHidden();
+    $(`#w-${id}`).hidden = true;
+    updateHiddenNote();
+    $('#main').focus({ preventScroll: true });
+    toast(`${WIDGETS[id]} hidden.`, { action: 'Undo', onAction: () => showWidgets([id]) });
+  },
+  'show-widgets': () => showWidgets([...hiddenWidgets]),
+  timeoff: async (el) => {
+    const id = Number(el.dataset.id);
+    const approve = el.dataset.decision === 'approve';
+    const request = dash.tasks.timeOff.find((r) => r.id === id);
+    if (!request) return;
+    const before = structuredClone(dash.tasks);
+    dash.tasks.timeOff = dash.tasks.timeOff.filter((r) => r.id !== id);
+    renderTasks();
+    ($('[data-action="timeoff"]') || $('#w-tasks-title'))?.focus?.();
+    try {
+      await api(`/time-off/${id}/${approve ? 'approve' : 'decline'}`, { method: 'POST' });
+      toast(approve
+        ? `Approved ${request.name}’s time off, ${dateSpan(request.from, request.to)}.${request.rosteredShifts ? ' Their rostered shifts still need cover.' : ''}`
+        : `Declined ${request.name}’s time-off request.`);
+    } catch (e) {
+      dash.tasks = before;
+      renderTasks();
+      toast(e.message, { tone: 'error' });
+    }
+  },
+});
+
+function showWidgets(ids) {
+  ids.forEach((id) => { hiddenWidgets.delete(id); const el = $(`#w-${id}`); if (el) el.hidden = false; });
+  saveHidden();
+  updateHiddenNote();
+  loadDashboard(ids);
+}
+
+/* --------------------------------------------------------------------------
+   Home: next shift, this week's pay, notifications, availability & leave
+   -------------------------------------------------------------------------- */
+const DAY_KEYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const payFormats = new Map();
+// Pay is personal, so it shows cents, and does so everywhere on this page.
+function pay(n) {
+  const currency = state.me?.company.currency || 'AUD';
+  if (!payFormats.has(currency))
+    payFormats.set(currency, new Intl.NumberFormat(locales, { style: 'currency', currency, minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+  return payFormats.get(currency).format(n);
+}
+const monthShort = new Intl.DateTimeFormat(locales, { month: 'short' });
+const dayName = (key) => fmt.dow.format(addDays(new Date(2024, 0, 1), DAY_KEYS.indexOf(key))); // 1 Jan 2024 was a Monday
+
+async function viewHome() {
+  state.view = 'home';
+  state.render = renderHome;
+  document.title = `Home · ${state.me.company.name}`;
+  const content = $('#content');
+  try {
+    const [home] = await withSkeleton(content, homeSkeleton(), () => Promise.all([api('/home'), loadSwaps()]));
+    if (state.view !== 'home') return;
+    state.home = home;
+    updateBadges();
+    renderHome();
+  } catch (e) {
+    if (e.status !== 401) content.innerHTML = errorState(e.message).v;
+  }
+}
+
+const homeSkeleton = () => html`
+  <div class="home" aria-busy="true" aria-label="Loading">
+    <div class="home-main">
+      <section class="home-hero"><span class="skeleton line w-40"></span></section>
+      <section class="home-card"><span class="skeleton shift-sk"></span></section>
+      <section class="home-card"><span class="skeleton shift-sk"></span><span class="skeleton line"></span></section>
+    </div>
+    <div class="home-side"><section class="home-card"><span class="skeleton line"></span><span class="skeleton line w-60"></span></section></div>
+  </div>`;
+
+/** Builds the page once; later refreshes only repaint the live parts so half-filled forms survive. */
+function renderHome() {
+  if (state.view !== 'home' || !state.home) return;
+  if (!$('#home-root')) {
+    const h = state.home;
+    const today = ymd(new Date());
+    $('#content').innerHTML = html`
+      <div class="home" id="home-root">
+        <div class="home-main">
+          <header class="home-hero">
+            <h1 class="home-brand"><img src="/brand/rostra-mark.svg" alt="" width="32" height="32"><span translate="no">rostra</span><span class="sr-only"> Home</span></h1>
+            <p class="home-company" translate="no">${state.me.company.name}</p>
+            <p class="home-greeting">Hi ${state.me.name.split(' ')[0]} · ${fmt.dayLong.format(new Date())}</p>
+          </header>
+          <section class="home-card next-card" id="home-next" aria-label="Next shift"></section>
+          <section class="home-card" id="home-earn" aria-labelledby="earn-title"></section>
+        </div>
+        <div class="home-side">
+          <section class="home-card" aria-labelledby="notes-title">
+            <h2 class="card-heading" id="notes-title">${icon('bell')}Notifications</h2>
+            <div id="home-notes" aria-live="polite"></div>
+          </section>
+          <section class="home-card" aria-labelledby="avail-title">
+            <h2 class="card-heading" id="avail-title">${icon('calendar-x')}Availability & Leave</h2>
+            <form id="avail-form" novalidate>
+              <fieldset class="day-toggles" aria-describedby="avail-hint">
+                <legend class="label">Days You Can Work</legend>
+                <div class="day-toggle-row">
+                  ${DAY_KEYS.map((d) => html`
+                    <label class="day-toggle">
+                      <input type="checkbox" name="day" value="${d}" data-field="days" ${h.availability.includes(d) ? raw('checked') : ''}>
+                      <span>${dayName(d)}</span>
+                    </label>`)}
+                </div>
+              </fieldset>
+              <p class="field-hint" id="avail-hint">You won’t be rostered, or offered as cover, on days you switch off.</p>
+              ${errorSlot('days', 'avail-error')}
+              <button type="submit" class="btn btn-primary">Save Availability</button>
+            </form>
+            <hr class="divider">
+            <form id="leave-form" novalidate>
+              <p class="label">${isManager() ? 'Add Leave' : 'Request Leave'}</p>
+              <div class="row-2">
+                <div class="field">
+                  <label for="lv-from">First Day</label>
+                  <input class="input num" id="lv-from" name="from" type="date" min="${today}" data-field="from">
+                  ${errorSlot('from', 'lv-from-error')}
+                </div>
+                <div class="field">
+                  <label for="lv-to">Last Day</label>
+                  <input class="input num" id="lv-to" name="to" type="date" min="${today}" data-field="to">
+                  ${errorSlot('to', 'lv-to-error')}
+                </div>
+              </div>
+              <div class="field">
+                <label for="lv-reason">Reason</label>
+                <input class="input" id="lv-reason" name="reason" type="text" maxlength="200" autocomplete="off" placeholder="e.g. Family wedding…" data-field="reason">
+                ${errorSlot('reason', 'lv-reason-error')}
+              </div>
+              <p class="field-hint">${isManager() ? 'As a manager, your leave is approved straight away.' : 'Your manager approves leave. You’ll see the status below.'}</p>
+              <p class="form-error" data-error-for="_" role="alert" hidden tabindex="-1"></p>
+              <button type="submit" class="btn btn-primary">${isManager() ? 'Add Leave' : 'Request Leave'}</button>
+            </form>
+            <div id="home-leave"></div>
+          </section>
+        </div>
+      </div>`.v;
+    wireHomeForms();
+  }
+  renderNextShift();
+  renderEarnings();
+  renderNotifications();
+  renderLeaveList();
+}
+
+function renderNextShift() {
+  const el = $('#home-next');
+  const s = state.home.nextShift;
+  if (!el) return;
+  if (!s) {
+    el.innerHTML = html`
+      <div class="next-row">
+        <div class="date-tile is-empty" aria-hidden="true">${icon('calendar')}</div>
+        <div class="next-text"><p class="next-label">Next Shift</p><p class="nothing">${isManager() ? 'You’re not rostered on for any upcoming shifts.' : 'No upcoming shifts yet.'}</p></div>
+      </div>
+      <footer class="next-foot"><span class="muted">Rostered Shift</span><a class="task-link" href="/app/my-shifts">See All Shifts${icon('right')}</a></footer>`.v;
+    return;
+  }
+  const start = parse(s.start);
+  const now = new Date();
+  const days = Math.round((parseDay(ymd(start)) - parseDay(ymd(now))) / 864e5);
+  const status = s.pendingCoverId != null
+    ? html`<span class="status is-pending">Swap pending</span>`
+    : s.clockIn ? html`<span class="status is-save">Clocked in</span>` : html`<span class="status">Confirmed</span>`;
+  el.innerHTML = html`
+    <div class="next-row">
+      <div class="date-tile" aria-hidden="true"><small>${monthShort.format(start)}</small><strong>${fmt.dayNum.format(start)}</strong></div>
+      <div class="next-text">
+        <p class="next-label">Next Shift ${status}</p>
+        <p class="next-time num">${dayLabel(start)} · ${fullRange(s.start, s.end)}</p>
+        <p class="muted" data-station="${s.station}"><span class="station-dot" aria-hidden="true"></span> ${s.station} | ${s.site}${days > 1 ? ` · ${rtf.format(days, 'day')}` : ''}</p>
+        ${s.pendingCoverName ? html`<p class="muted">Waiting on ${s.pendingCoverName} to cover.</p>` : ''}
+      </div>
+    </div>
+    <footer class="next-foot"><span class="muted">Rostered Shift</span><a class="task-link" href="/app/my-shifts">See All Shifts${icon('right')}</a></footer>`.v;
+}
+
+function renderEarnings() {
+  const el = $('#home-earn');
+  if (!el) return;
+  const w = state.home.week;
+  const total = { count: w.pending.count + w.completed.count, hours: w.pending.hours + w.completed.hours, pay: w.pending.pay + w.completed.pay };
+  const share = total.pay ? w.completed.pay / total.pay : 0;
+  const r = 50;
+  const circumference = 2 * Math.PI * r;
+  const range = fmt.range.formatRange(parseDay(w.start), parseDay(w.end));
+  el.innerHTML = html`
+    <header class="earn-head">
+      <h2 class="card-heading" id="earn-title">${plural(w.shifts, 'Confirmed Shift', 'Confirmed Shifts')}</h2>
+      <p class="muted num">${range}</p>
+    </header>
+    ${w.shifts ? html`
+      <div class="earn-grid">
+        <div class="gauge" role="meter" aria-label="Pay earned so far this week" aria-valuemin="0" aria-valuemax="${total.pay.toFixed(2)}"
+             aria-valuenow="${w.completed.pay.toFixed(2)}" aria-valuetext="${pay(w.completed.pay)} of ${pay(total.pay)}">
+          <svg viewBox="0 0 120 120" width="132" height="132" aria-hidden="true">
+            <circle class="gauge-track" cx="60" cy="60" r="${r}"></circle>
+            <circle class="gauge-fill" cx="60" cy="60" r="${r}" stroke-dasharray="${(share * circumference).toFixed(1)} ${circumference.toFixed(1)}"></circle>
+          </svg>
+          <div class="gauge-label"><strong class="num">${pay(w.completed.pay)}</strong><span class="num">of ${pay(total.pay)}</span></div>
+        </div>
+        <table class="earn-table">
+          <thead><tr><th scope="col"><span class="sr-only">Status</span></th><th scope="col">Hours</th><th scope="col">Est. Pay</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Pending <small>${plural(w.pending.count, 'shift', 'shifts')}</small></th><td class="num">${fmt.hours.format(w.pending.hours)}</td><td class="num">${pay(w.pending.pay)}</td></tr>
+            <tr><th scope="row">Completed <small>${plural(w.completed.count, 'shift', 'shifts')}</small></th><td class="num">${fmt.hours.format(w.completed.hours)}</td><td class="num">${pay(w.completed.pay)}</td></tr>
+          </tbody>
+          <tfoot><tr><th scope="row">Total</th><td class="num">${fmt.hours.format(total.hours)}</td><td class="num">${pay(total.pay)}</td></tr></tfoot>
+        </table>
+      </div>
+      <p class="earn-note muted">Estimated before tax, at your hourly rate with weekend penalty rates. Completed shifts use your clocked hours. Updated ${fmt.time.format(new Date())}.</p>`
+    : html`<p class="nothing">No shifts this week, so nothing earned yet.</p>`}`.v;
+}
+
+function renderNotifications() {
+  const el = $('#home-notes');
+  if (!el) return;
+  const me = state.me.id;
+  const swaps = [...state.swaps].sort((a, b) => parse(a.start) - parse(b.start));
+  if (!swaps.length) {
+    el.innerHTML = html`<p class="nothing">Nothing yet</p>`.v;
+    return;
+  }
+  el.innerHTML = html`<ul class="notes">${swaps.map((s) => {
+    const when = `${fmt.dow.format(parse(s.start))} ${fmt.dayNum.format(parse(s.start))} ${monthShort.format(parse(s.start))}, ${compact(s.start, s.end)}`;
+    const [title, sub] = isManager()
+      ? [`${s.from.name} asked ${s.cover.name} to cover ${when}`, 'Needs your approval']
+      : s.from.id === me
+        ? [`You asked ${s.cover.name} to cover ${when}`, 'Waiting for your manager to approve']
+        : [`${s.from.name} asked you to cover ${when}`, 'Your manager will confirm it'];
+    return html`
+      <li>
+        <a class="note" href="/app/swaps">
+          <span class="note-icon" aria-hidden="true">${icon('swap')}</span>
+          <span class="note-text"><strong>${title}</strong><span class="muted">${s.site} · ${sub}</span></span>
+          ${icon('right')}
+        </a>
+      </li>`;
+  })}</ul>`.v;
+}
+
+function renderLeaveList() {
+  const el = $('#home-leave');
+  if (!el) return;
+  const today = ymd(new Date());
+  const list = state.home.timeOff;
+  el.innerHTML = list.length ? html`
+    <h3 class="label leave-heading">Your Leave</h3>
+    <ul class="leave-items">${list.map((t) => html`
+      <li class="leave-item">
+        <div class="leave-text">
+          <strong class="num">${dateSpan(t.from, t.to)}</strong>
+          <span class="muted">${t.reason}</span>
+        </div>
+        <span class="status ${t.status === 'Approved' ? 'is-save' : t.status === 'Declined' ? 'is-danger' : 'is-pending'}">${t.status}</span>
+        ${t.from > today && t.status !== 'Declined' ? html`<button type="button" class="btn btn-ghost btn-sm" data-action="cancel-leave" data-id="${t.id}" aria-label="Cancel leave on ${dateSpan(t.from, t.to)}">Cancel</button>` : ''}
+      </li>`)}</ul>` .v : '';
+}
+
+function wireHomeForms() {
+  const avail = $('#avail-form');
+  avail.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    clearErrors(avail);
+    const days = $$('input[name="day"]:checked', avail).map((i) => i.value);
+    if (!days.length) return showErrors(avail, { days: 'Choose at least one day you can work. For time away, request leave instead.' });
+    await withLoading(e.submitter, async () => {
+      try {
+        const result = await api('/me/availability', { method: 'PUT', body: { days } });
+        state.home.availability = result.availability;
+        toast(`Availability saved: ${result.availability.map(dayName).join(', ')}.`);
+      } catch (err) {
+        if (err.errors) return showErrors(avail, fromServer(err.errors));
+        toast(err.message, { tone: 'error' });
+      }
+    });
+  });
+
+  const leave = $('#leave-form');
+  leave.from.addEventListener('change', () => {
+    leave.to.min = leave.from.value || ymd(new Date());
+    if (!leave.to.value || leave.to.value < leave.from.value) leave.to.value = leave.from.value;
+  });
+  leave.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    clearErrors(leave);
+    const body = { from: leave.from.value || null, to: leave.to.value || null, reason: leave.reason.value.trim() };
+    const errors = {};
+    if (!body.from) errors.from = 'Choose your first day off.';
+    if (!body.to) errors.to = 'Choose your last day off.';
+    else if (body.from && body.to < body.from) errors.to = 'The last day must be on or after the first day.';
+    if (!body.reason) errors.reason = 'Add a short reason, like “Family wedding”.';
+    if (Object.keys(errors).length) return showErrors(leave, errors);
+    await withLoading(e.submitter, async () => {
+      try {
+        const created = await api('/me/time-off', { method: 'POST', body });
+        state.home.timeOff = [...state.home.timeOff, created].sort((a, b) => a.from.localeCompare(b.from));
+        leave.reset();
+        renderLeaveList();
+        const clash = created.rosteredShifts ? ` You’re rostered on ${plural(created.rosteredShifts, 'shift', 'shifts')} then, so ${isManager() ? 'arrange cover' : 'your manager will arrange cover'}.` : '';
+        toast(`${created.status === 'Approved' ? 'Leave added' : 'Leave requested'} for ${dateSpan(created.from, created.to)}.${clash}`);
+      } catch (err) {
+        if (err.errors) return showErrors(leave, fromServer(err.errors));
+        const general = $('[data-error-for="_"]', leave);
+        general.innerHTML = html`${icon('alert')}<span>${err.message}</span>`.v;
+        general.hidden = false;
+        general.focus();
+      }
+    });
+  });
+}
+
+Object.assign(actions, {
+  'cancel-leave': async (el) => {
+    const id = Number(el.dataset.id);
+    const item = state.home.timeOff.find((t) => t.id === id);
+    if (!item || !confirm(`Cancel your leave on ${dateSpan(item.from, item.to)}?`)) return;
+    await withLoading(el, async () => {
+      try {
+        await api(`/me/time-off/${id}`, { method: 'DELETE' });
+        state.home.timeOff = state.home.timeOff.filter((t) => t.id !== id);
+        renderLeaveList();
+        $('#leave-form')?.from.focus();
+        toast('Leave cancelled.');
+      } catch (e) { toast(e.message, { tone: 'error' }); }
+    });
+  },
 });
 
 /* Arrow keys move between roster cells (WAI-ARIA grid-style navigation). */

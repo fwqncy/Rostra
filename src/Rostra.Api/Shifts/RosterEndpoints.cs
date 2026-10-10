@@ -16,12 +16,9 @@ public record ShiftInput(
     int StaffId, int SiteId, DateTime Start, DateTime End,
     int BreakMinutes, Station Station, string? Notes);
 
-/// <summary>Weekly award penalty multipliers applied to labour cost.</summary>
-public record Penalties(decimal Saturday, decimal Sunday);
-
 public static class RosterEndpoints
 {
-    public static readonly Penalties Penalties = new(1.25m, 1.50m);
+    static readonly Penalties Penalties = Labour.Penalties;
 
     static readonly Expression<Func<Shift, ShiftDto>> ToDto = s => new ShiftDto(
         s.Id, s.SiteId, s.StaffId, s.Start, s.End, s.BreakMinutes, s.Station, s.Notes, s.PendingCoverId);
@@ -35,13 +32,13 @@ public static class RosterEndpoints
 
         // Anonymous-friendly so the SPA can ask "am I signed in?" without a 401: 204 means no.
         app.MapGet("/me", GetMe).AllowAnonymous();
-        staff.MapGet("/schedule", GetSchedule);
         staff.MapGet("/my-shifts", GetMyShifts);
         staff.MapGet("/swaps", GetSwaps);
         staff.MapGet("/shifts/{id:int}/cover-options", GetCoverOptions).AddEndpointFilter<OwnShiftFilter>();
         staff.MapPost("/shifts/{id:int}/swap/decline", DeclineSwap);
         staff.MapGet("/events", StreamEvents);
 
+        manager.MapGet("/schedule", GetSchedule);
         manager.MapPost("/shifts", CreateShift);
         manager.MapPut("/shifts/{id:int}", UpdateShift);
         manager.MapDelete("/shifts/{id:int}", DeleteShift);
@@ -70,7 +67,7 @@ public static class RosterEndpoints
         var site = await db.Sites.FirstOrDefaultAsync(s => s.Id == (siteId ?? me.HomeSiteId))
                    ?? await db.Sites.OrderBy(s => s.Id).FirstAsync();
 
-        var monday = Week.StartOf(week ?? DateOnly.FromDateTime(DateTime.Today));
+        var monday = Week.StartOf(week ?? DateOnly.FromDateTime(await db.NowAsync()));
         var from = monday.ToDateTime(TimeOnly.MinValue);
         var to = from.AddDays(7);
 
@@ -84,11 +81,11 @@ public static class RosterEndpoints
 
         var isManager = user.IsManager();
         var people = await db.Staff
-            .Where(s => s.IsActive && ((s.HomeSiteId == site.Id && s.Role == StaffRole.Staff) || onRoster.Contains(s.Id)))
-            .OrderBy(s => s.Id)
+            .Where(s => s.IsActive && (s.HomeSiteId == site.Id || onRoster.Contains(s.Id)))
+            .OrderBy(s => s.Role == StaffRole.Manager ? 0 : 1).ThenBy(s => s.Id)
             .Select(s => new
             {
-                s.Id, s.Name, s.Title, s.Stations, s.PrimaryStation, s.HomeSiteId,
+                s.Id, s.Name, s.Title, s.Role, s.Stations, s.PrimaryStation, s.HomeSiteId,
                 // Pay rates are manager-only.
                 HourlyRate = isManager ? s.HourlyRate : (decimal?)null,
             })
@@ -107,7 +104,7 @@ public static class RosterEndpoints
     static async Task<IResult> GetMyShifts(ClaimsPrincipal user, RostraDb db)
     {
         var me = user.StaffId();
-        var since = DateTime.Today;
+        var since = (await db.NowAsync()).Date;
         var shifts = await db.Shifts
             .Where(s => (s.StaffId == me || s.PendingCoverId == me) && s.End >= since)
             .OrderBy(s => s.Start).Take(40)
@@ -116,6 +113,8 @@ public static class RosterEndpoints
                 s.Id, s.SiteId, Site = s.Site!.Name, s.StaffId, StaffName = s.Staff!.Name,
                 s.Start, s.End, s.BreakMinutes, s.Station, s.Notes,
                 s.PendingCoverId, PendingCoverName = s.PendingCover != null ? s.PendingCover.Name : null,
+                ClockIn = db.ClockEvents.Where(c => c.ShiftId == s.Id && c.Kind == ClockKind.In).Min(c => (DateTime?)c.At),
+                ClockOut = db.ClockEvents.Where(c => c.ShiftId == s.Id && c.Kind == ClockKind.Out).Max(c => (DateTime?)c.At),
             })
             .ToListAsync();
         return Results.Ok(shifts);
@@ -144,11 +143,13 @@ public static class RosterEndpoints
         var shift = await db.Shifts.FirstOrDefaultAsync(s => s.Id == id);
         if (shift is null) return Results.NotFound();
 
-        // Only load shifts that could clash, then let the domain decide.
+        // Only load shifts and leave that could clash, then let the domain decide.
+        var day = DateOnly.FromDateTime(shift.Start);
         var colleagues = await db.Staff
             .Include(s => s.HomeSite)
             .Include(s => s.Shifts.Where(o => o.Start < shift.End && o.End > shift.Start))
-            .Where(s => s.IsActive && s.Role == StaffRole.Staff && s.Id != shift.StaffId)
+            .Include(s => s.TimeOff.Where(t => t.Status == RequestStatus.Approved && t.From <= day && t.To >= day))
+            .Where(s => s.IsActive && s.Id != shift.StaffId)
             .ToListAsync();
 
         var isManager = user.IsManager();

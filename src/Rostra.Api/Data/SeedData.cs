@@ -14,12 +14,15 @@ public static class SeedData
     record Crew(string Name, Station Stations, string Pattern);
     record SiteSeed(string Name, decimal Budget, Crew[] Crew);
     record CompanySeed(
-        string Name, string Slug, string Domain, string Accent, string Tagline,
+        string Name, string Slug, string Domain, string Accent, string TimeZone, string Tagline,
         string Manager, string ManagerTitle, string? PreferredCover, SiteSeed[] Sites);
 
     public record DemoAccount(
         string Company, string Accent, string Tagline,
         string ManagerName, string ManagerEmail, string StaffName, string StaffEmail);
+
+    /// <summary>Managers work the floor too: Monday, Thursday and Saturday, 9–5.</summary>
+    const string ManagerPattern = "D..D.D.";
 
     // Template codes for a usual week, Mon–Sun. '.' = day off, 'x' = unavailable.
     static readonly string[] Patterns = ["DD.DD..", ".DDD.D.", "OOO.O..", "..CCCC.", "...CCCC", "EE...EE", ".x..MMM", "M.MM.M."];
@@ -35,7 +38,7 @@ public static class SeedData
 
     static readonly CompanySeed[] Companies =
     [
-        new("Ember & Oak", "ember-oak", "emberandoak.test", "#E8590C",
+        new("Ember & Oak", "ember-oak", "emberandoak.test", "#E8590C", "Australia/Brisbane",
             "Wood-fired grill · South East Queensland",
             "Sam Whitlock", "Operations Manager", PreferredCover: "Jordan",
             [
@@ -55,14 +58,14 @@ public static class SeedData
                 new("Springfield", 7900m, Rotate(1, "Hannah", "Riley", "Wiremu", "Sofia", "Ethan", "Leilani", "Marcus", "Chloe")),
                 new("Toowong", 6900m, Rotate(3, "Ava", "Kai", "Zara", "Oliver", "Ngaio", "Ben", "Lucia", "Ravi")),
             ]),
-        new("Saltbush Kitchen", "saltbush", "saltbush.test", "#0F9D7A",
+        new("Saltbush Kitchen", "saltbush", "saltbush.test", "#0F9D7A", "Australia/Perth",
             "Native produce dining · Western Australia",
             "Maya Collins", "Group Manager", PreferredCover: null,
             [
                 new("Fremantle", 8200m, Rotate(0, "Matilda", "Jack", "Anika", "Tom", "Yuki", "Sienna", "Darcy", "Farah")),
                 new("Perth CBD", 8800m, Rotate(2, "Lachlan", "Ruby", "Arjun", "Georgia", "Hamish", "Imogen", "Kiri", "Sam")),
             ]),
-        new("Juniper & Co.", "juniper", "juniperco.test", "#7C5CFF",
+        new("Juniper & Co.", "juniper", "juniperco.test", "#7C5CFF", "Australia/Melbourne",
             "Wine bars & small plates · Melbourne",
             "Alex Romano", "Venue Director", PreferredCover: null,
             [
@@ -85,7 +88,11 @@ public static class SeedData
     {
         if (!await db.Companies.AnyAsync())
             await SeedCompaniesAsync(db);
+        await EnsureManagersRosteredAsync(db, today);
         await EnsureRosterAsync(db, today);
+        await EnsureCertificationsAsync(db, today);
+        await EnsureTimeOffAsync(db, today);
+        await EnsureRevenueAsync(db, today);
     }
 
     static async Task SeedCompaniesAsync(RostraDb db)
@@ -95,7 +102,7 @@ public static class SeedData
 
         foreach (var c in Companies)
         {
-            var company = new Company { Name = c.Name, Slug = c.Slug, Accent = c.Accent };
+            var company = new Company { Name = c.Name, Slug = c.Slug, Accent = c.Accent, TimeZone = c.TimeZone };
             db.Companies.Add(company);
             await db.SaveChangesAsync();
 
@@ -108,6 +115,7 @@ public static class SeedData
                 CompanyId = company.Id, HomeSiteId = sites[0].Id, Name = c.Manager, Title = c.ManagerTitle,
                 Email = Email(c.Manager, c.Domain), PasswordHash = hash, Role = StaffRole.Manager,
                 HourlyRate = 46.50m, Stations = Station.Floor | Station.Bar, PrimaryStation = Station.Floor,
+                UsualPattern = ManagerPattern,
             });
 
             for (var s = 0; s < sites.Count; s++)
@@ -140,7 +148,7 @@ public static class SeedData
         var companies = await db.Companies.ToListAsync();
         var sites = await db.Sites.IgnoreQueryFilters().ToListAsync();
         var crew = await db.Staff.IgnoreQueryFilters()
-            .Where(s => s.Role == StaffRole.Staff && s.IsActive && s.UsualPattern != null)
+            .Where(s => s.IsActive && s.UsualPattern != null)
             .OrderBy(s => s.Id).ToListAsync();
 
         for (var w = -1; w <= 3; w++)
@@ -154,6 +162,7 @@ public static class SeedData
             foreach (var site in sites.Where(s => !rostered.Contains(s.Id)))
             {
                 var team = crew.Where(s => s.HomeSiteId == site.Id).ToList();
+                var swapTeam = team.Where(s => s.Role == StaffRole.Staff).ToList();
                 var week = new List<Shift>();
                 for (var i = 0; i < team.Count; i++)
                 {
@@ -174,8 +183,47 @@ public static class SeedData
                     }
                 }
 
-                if (w is 0 or 1) AddPendingSwap(week, team, companies.First(c => c.Id == site.CompanyId), site, sites, w);
+                if (w is 0 or 1) AddPendingSwap(week, swapTeam, companies.First(c => c.Id == site.CompanyId), site, sites, w);
                 db.Shifts.AddRange(week);
+            }
+        }
+        await db.SaveChangesAsync();
+    }
+
+    /// <summary>
+    /// Databases seeded before managers were on the roster: give each manager a usual week and
+    /// slot their shifts into weeks that already exist. Runs once (the pattern marks it done).
+    /// </summary>
+    static async Task EnsureManagersRosteredAsync(RostraDb db, DateOnly today)
+    {
+        var managers = await db.Staff.IgnoreQueryFilters()
+            .Where(s => s.Role == StaffRole.Manager && s.IsActive && s.UsualPattern == null)
+            .ToListAsync();
+        if (managers.Count == 0) return;
+
+        var monday = Week.StartOf(today);
+        foreach (var m in managers)
+        {
+            m.UsualPattern = ManagerPattern;
+            var mine = await db.Shifts.IgnoreQueryFilters().Where(s => s.StaffId == m.Id).ToListAsync();
+            for (var w = -1; w <= 3; w++)
+            {
+                var weekStart = monday.AddDays(7 * w).ToDateTime(TimeOnly.MinValue);
+                // Only weeks the roster generator has already filled; empty weeks get the pattern later.
+                if (!await db.Shifts.IgnoreQueryFilters().AnyAsync(s => s.SiteId == m.HomeSiteId && s.Start >= weekStart && s.Start < weekStart.AddDays(7)))
+                    continue;
+                for (var d = 0; d < 7; d++)
+                {
+                    if (Template(ManagerPattern[d]) is not { } t) continue;
+                    var start = weekStart.AddDays(d).AddMinutes(t.Start);
+                    var end = weekStart.AddDays(d).AddMinutes(t.End);
+                    if (mine.Any(s => s.Start < end && start < s.End)) continue;
+                    db.Shifts.Add(new Shift
+                    {
+                        CompanyId = m.CompanyId, SiteId = m.HomeSiteId, StaffId = m.Id,
+                        Start = start, End = end, BreakMinutes = t.Break, Station = m.PrimaryStation,
+                    });
+                }
             }
         }
         await db.SaveChangesAsync();
@@ -212,6 +260,111 @@ public static class SeedData
         'L' => (17 * 60, 22 * 60, 0),           // late, 5–10
         _ => null,
     };
+
+    static string CertificationFor(Station primary) => primary switch
+    {
+        Station.Kitchen => "Food Safety Supervisor",
+        Station.Barista => "Food Handler",
+        _ => "RSA",
+    };
+
+    /// <summary>Most tickets are years out; a couple per company lapse within the month so there's something to chase.</summary>
+    static async Task EnsureCertificationsAsync(RostraDb db, DateOnly today)
+    {
+        var crew = await db.Staff.IgnoreQueryFilters().Where(s => s.Role == StaffRole.Staff).OrderBy(s => s.Id).ToListAsync();
+        if (crew.Any(s => s.CertificationExpires >= today)) return;
+        for (var i = 0; i < crew.Count; i++)
+        {
+            crew[i].Certification = CertificationFor(crew[i].PrimaryStation);
+            crew[i].CertificationExpires = i % 13 == 4
+                ? today.AddDays(9 + i % 17)
+                : today.AddDays(120 + (i * 37) % 600);
+        }
+        await db.SaveChangesAsync();
+    }
+
+    static readonly string[] Reasons = ["Uni exams", "Family wedding", "Medical appointment", "Moving house", "Sister’s graduation", "Weekend away"];
+
+    /// <summary>Keeps a few pending time-off requests in the near future, and someone on leave today.</summary>
+    static async Task EnsureTimeOffAsync(RostraDb db, DateOnly today)
+    {
+        if (await db.TimeOff.IgnoreQueryFilters().AnyAsync(t => t.To >= today)) return;
+
+        var dayStart = today.ToDateTime(TimeOnly.MinValue);
+        var busyToday = await db.Shifts.IgnoreQueryFilters()
+            .Where(s => s.Start >= dayStart && s.Start < dayStart.AddDays(1)).Select(s => s.StaffId).ToListAsync();
+        var crew = await db.Staff.IgnoreQueryFilters()
+            .Where(s => s.Role == StaffRole.Staff).OrderBy(s => s.Id).ToListAsync();
+
+        foreach (var team in crew.GroupBy(s => s.CompanyId))
+        {
+            var people = team.ToList();
+            for (var i = 0; i < 3 && i * 5 + 1 < people.Count; i++)
+            {
+                var from = today.AddDays(3 + i * 4);
+                db.TimeOff.Add(new TimeOffRequest
+                {
+                    CompanyId = team.Key, StaffId = people[i * 5 + 1].Id, From = from, To = from.AddDays(i % 2),
+                    Reason = Reasons[(team.Key + i) % Reasons.Length], Status = RequestStatus.Pending,
+                    CreatedAt = DateTime.Now.AddHours(-6 - i * 9),
+                });
+            }
+
+            var away = people.FirstOrDefault(p => !busyToday.Contains(p.Id) && p.HomeSiteId == people[0].HomeSiteId);
+            if (away is not null)
+                db.TimeOff.Add(new TimeOffRequest
+                {
+                    CompanyId = team.Key, StaffId = away.Id, From = today, To = today.AddDays(1),
+                    Reason = "Annual leave", Status = RequestStatus.Approved, CreatedAt = DateTime.Now.AddDays(-12),
+                });
+        }
+        await db.SaveChangesAsync();
+    }
+
+    /// <summary>
+    /// Daily takings: a forecast for every day in the roster window, and an "actual" for days that
+    /// have finished, the way a POS integration would fill it in overnight.
+    /// </summary>
+    static async Task EnsureRevenueAsync(RostraDb db, DateOnly today)
+    {
+        var monday = Week.StartOf(today);
+        var from = monday.AddDays(-7);
+        var to = monday.AddDays(28);
+        var sites = await db.Sites.IgnoreQueryFilters().ToListAsync();
+        var existing = await db.SiteDays.IgnoreQueryFilters().Where(d => d.Date >= from && d.Date < to).ToListAsync();
+
+        foreach (var site in sites)
+        {
+            // Budget is ~28% of expected weekly sales, so revenue scales with the site.
+            var weekly = site.WeeklyBudget / 0.28m;
+            for (var date = from; date < to; date = date.AddDays(1))
+            {
+                var row = existing.FirstOrDefault(d => d.SiteId == site.Id && d.Date == date);
+                if (row is null)
+                {
+                    var share = date.DayOfWeek switch
+                    {
+                        DayOfWeek.Friday => 0.19m, DayOfWeek.Saturday => 0.22m, DayOfWeek.Sunday => 0.16m,
+                        DayOfWeek.Monday => 0.09m, _ => 0.113m,
+                    };
+                    var wobble = 0.94m + Noise(site.Id, date, 1) * 0.12m;
+                    row = new SiteDay { CompanyId = site.CompanyId, SiteId = site.Id, Date = date, ForecastRevenue = Math.Round(weekly * share * wobble, 2) };
+                    db.SiteDays.Add(row);
+                }
+                if (row.ActualRevenue is null && date < today)
+                    row.ActualRevenue = Math.Round(row.ForecastRevenue * (0.86m + Noise(site.Id, date, 2) * 0.26m), 2);
+            }
+        }
+        await db.SaveChangesAsync();
+    }
+
+    /// <summary>Deterministic 0–1 noise so demo numbers are stable across restarts.</summary>
+    static decimal Noise(int siteId, DateOnly date, int salt)
+    {
+        var h = (uint)(siteId * 73856093 ^ date.DayNumber * 19349663 ^ salt * 83492791);
+        h ^= h >> 13; h *= 0x5bd1e995; h ^= h >> 15;
+        return (h % 1000) / 1000m;
+    }
 
     static Days Availability(string pattern)
     {
