@@ -1,0 +1,17 @@
+{
+  "name": "rostra-grove",
+  "private": true,
+  "type": "module",
+  "description": "The Grove: Rostra's growing cherry-blossom tree, built with React Three Fiber and bundled into wwwroot.",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@react-three/fiber": "8.17.10",
+    "react": "18.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.21.5",
+    "three": "0.169.0"
+  }
+}

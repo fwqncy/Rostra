@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Rostra.Api.Auth;
 using Rostra.Api.Dashboard;
+using Rostra.Api.Features;
 using Rostra.Api.Home;
 using Rostra.Api.Data;
 using Rostra.Api.Domain;
@@ -32,6 +33,7 @@ builder.Services.AddSingleton<EventHub>();
 if (builder.Configuration.GetValue("Demo:Enabled", false))
     builder.Services.AddHostedService<DemoCrewService>();
 builder.Services.AddScoped<INotifier, LiveNotifier>();
+builder.Services.AddScoped<Inbox>();
 builder.Services.AddSingleton<IPasswordHasher<Staff>, PasswordHasher<Staff>>();
 builder.Services.AddMemoryCache();
 builder.Services.AddHealthChecks();
@@ -62,6 +64,10 @@ builder.Services.AddRateLimiter(o =>
     o.AddPolicy("login", ctx => RateLimitPartition.GetFixedWindowLimiter(
         ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
         _ => new FixedWindowRateLimiterOptions { PermitLimit = 10, Window = TimeSpan.FromMinutes(1) }));
+    // Calendar apps poll the feed; this keeps a leaked link from being hammered.
+    o.AddPolicy("calendar", ctx => RateLimitPartition.GetFixedWindowLimiter(
+        ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 30, Window = TimeSpan.FromMinutes(5) }));
 });
 
 var app = builder.Build();
@@ -69,19 +75,24 @@ var app = builder.Build();
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<RostraDb>();
-    await db.Database.EnsureCreatedAsync();
+    var created = await db.Database.EnsureCreatedAsync();
 
-    // EnsureCreated can't evolve a schema. A local SQLite demo DB from an older version is simply rebuilt.
-    if (db.Database.IsSqlite() && !await SchemaIsCurrentAsync(db))
+    // EnsureCreated can't evolve a schema. A local SQLite demo database from another version is rebuilt;
+    // SQLite's built-in user_version records which model it was created from.
+    if (db.Database.IsSqlite())
     {
-        app.Logger.LogWarning("Local demo database is from an older version of Rostra; recreating it.");
-        var file = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(db.Database.GetConnectionString()).DataSource;
-        await db.Database.CloseConnectionAsync();
-        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-        // Remove the WAL/SHM side files too, or SQLite reports a disk I/O error on the fresh file.
-        foreach (var path in new[] { file, $"{file}-wal", $"{file}-shm" })
-            if (File.Exists(path)) File.Delete(path);
-        await db.Database.EnsureCreatedAsync();
+        if (!created && await SqliteSchemaVersionAsync(db) != RostraDb.SchemaVersion)
+        {
+            app.Logger.LogWarning("Local demo database is from another version of Rostra; recreating it.");
+            var file = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(db.Database.GetConnectionString()).DataSource;
+            await db.Database.CloseConnectionAsync();
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            // Remove the WAL/SHM side files too, or SQLite reports a disk I/O error on the fresh file.
+            foreach (var path in new[] { file, $"{file}-wal", $"{file}-shm" })
+                if (File.Exists(path)) File.Delete(path);
+            await db.Database.EnsureCreatedAsync();
+        }
+        await db.Database.ExecuteSqlRawAsync($"PRAGMA user_version = {RostraDb.SchemaVersion}");
     }
 
     if (app.Configuration.GetValue("Demo:Enabled", false))
@@ -129,20 +140,15 @@ app.MapRoster();
 app.MapSwaps();
 app.MapDashboard();
 app.MapHome();
+app.MapPublishing();
+app.MapCommunity();
+app.MapManagement();
+app.MapPersonal();
 
 // Client-side routes (/login, /app/schedule, …) all load the single-page app.
 app.MapFallbackToFile("index.html");
 
 app.Run();
 
-static async Task<bool> SchemaIsCurrentAsync(RostraDb db)
-{
-    // Look for the newest table and column without throwing (and logging) on an old schema.
-    var tables = await db.Database
-        .SqlQuery<int>($"SELECT COUNT(*) AS Value FROM sqlite_master WHERE type = 'table' AND name IN ('ClockEvents', 'SiteDays', 'TimeOff')")
-        .SingleAsync();
-    var columns = await db.Database
-        .SqlQuery<int>($"SELECT (SELECT COUNT(*) FROM pragma_table_info('Staff') WHERE name = 'CertificationExpires') + (SELECT COUNT(*) FROM pragma_table_info('Companies') WHERE name = 'TimeZone') AS Value")
-        .SingleAsync();
-    return tables == 3 && columns == 2;
-}
+static Task<int> SqliteSchemaVersionAsync(RostraDb db) =>
+    db.Database.SqlQuery<int>($"SELECT user_version AS Value FROM pragma_user_version").SingleAsync();

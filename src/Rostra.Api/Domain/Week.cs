@@ -16,6 +16,13 @@ public static class Week
         _ => Days.Sun,
     };
 
+    /// <summary>"Wed 14 Oct, 9–5": how a shift reads in a notification.</summary>
+    public static string Label(DateTime start, DateTime end) =>
+        $"{start.ToString("ddd d MMM", System.Globalization.CultureInfo.InvariantCulture)}, {Compact(start, end)}";
+
+    /// <summary>ISO-8601 week number, as rosters are usually labelled ("Week 42").</summary>
+    public static int Number(DateTime day) => System.Globalization.ISOWeek.GetWeekOfYear(day);
+
     /// <summary>"9–5", "4–11", "6:30–2:30" — how rosters are written on the back-of-house wall.</summary>
     public static string Compact(DateTime start, DateTime end) => $"{Hour(start)}–{Hour(end)}";
 

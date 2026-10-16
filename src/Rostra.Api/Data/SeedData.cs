@@ -5,7 +5,8 @@ using Rostra.Api.Domain;
 namespace Rostra.Api.Data;
 
 /// <summary>
-/// Three demo restaurant groups, each with its own brand accent, so sign-in visibly re-themes the app.
+/// Three demo restaurant groups. Each has its own default colour scheme, so signing in to each one
+/// shows a different look: Overgrowth (the app default), the company's brand colour, and Burgundy &amp; Navy.
 /// </summary>
 public static class SeedData
 {
@@ -14,11 +15,11 @@ public static class SeedData
     record Crew(string Name, Station Stations, string Pattern);
     record SiteSeed(string Name, decimal Budget, Crew[] Crew);
     record CompanySeed(
-        string Name, string Slug, string Domain, string Accent, string TimeZone, string Tagline,
+        string Name, string Slug, string Domain, string Accent, string TimeZone, string Scheme, string Tagline,
         string Manager, string ManagerTitle, string? PreferredCover, SiteSeed[] Sites);
 
     public record DemoAccount(
-        string Company, string Accent, string Tagline,
+        string Company, string Accent, string Scheme, string Tagline,
         string ManagerName, string ManagerEmail, string StaffName, string StaffEmail);
 
     /// <summary>Managers work the floor too: Monday, Thursday and Saturday, 9–5.</summary>
@@ -38,7 +39,7 @@ public static class SeedData
 
     static readonly CompanySeed[] Companies =
     [
-        new("Ember & Oak", "ember-oak", "emberandoak.test", "#E8590C", "Australia/Brisbane",
+        new("Ember & Oak", "ember-oak", "emberandoak.test", "#E8590C", "Australia/Brisbane", "overgrowth",
             "Wood-fired grill · South East Queensland",
             "Sam Whitlock", "Operations Manager", PreferredCover: "Jordan",
             [
@@ -58,14 +59,14 @@ public static class SeedData
                 new("Springfield", 7900m, Rotate(1, "Hannah", "Riley", "Wiremu", "Sofia", "Ethan", "Leilani", "Marcus", "Chloe")),
                 new("Toowong", 6900m, Rotate(3, "Ava", "Kai", "Zara", "Oliver", "Ngaio", "Ben", "Lucia", "Ravi")),
             ]),
-        new("Saltbush Kitchen", "saltbush", "saltbush.test", "#0F9D7A", "Australia/Perth",
+        new("Saltbush Kitchen", "saltbush", "saltbush.test", "#0F9D7A", "Australia/Perth", "brand",
             "Native produce dining · Western Australia",
             "Maya Collins", "Group Manager", PreferredCover: null,
             [
                 new("Fremantle", 8200m, Rotate(0, "Matilda", "Jack", "Anika", "Tom", "Yuki", "Sienna", "Darcy", "Farah")),
                 new("Perth CBD", 8800m, Rotate(2, "Lachlan", "Ruby", "Arjun", "Georgia", "Hamish", "Imogen", "Kiri", "Sam")),
             ]),
-        new("Juniper & Co.", "juniper", "juniperco.test", "#7C5CFF", "Australia/Melbourne",
+        new("Juniper & Co.", "juniper", "juniperco.test", "#7C5CFF", "Australia/Melbourne", "burgundy-navy",
             "Wine bars & small plates · Melbourne",
             "Alex Romano", "Venue Director", PreferredCover: null,
             [
@@ -78,7 +79,7 @@ public static class SeedData
     public static IReadOnlyList<DemoAccount> DemoAccounts { get; } = Companies.Select(c =>
     {
         var staff = c.Sites[0].Crew[c.Slug == "ember-oak" ? 2 : 0].Name; // Priya for Ember & Oak
-        return new DemoAccount(c.Name, c.Accent, c.Tagline,
+        return new DemoAccount(c.Name, c.Accent, c.Scheme, c.Tagline,
             c.Manager, Email(c.Manager, c.Domain), staff, Email(staff, c.Domain));
     }).ToList();
 
@@ -93,6 +94,12 @@ public static class SeedData
         await EnsureCertificationsAsync(db, today);
         await EnsureTimeOffAsync(db, today);
         await EnsureRevenueAsync(db, today);
+        await EnsureRosterWeeksAsync(db, today);
+        await EnsureGrowthAsync(db);
+        await EnsureKudosAsync(db);
+        await EnsureAnnouncementsAsync(db);
+        await EnsureTimesheetsAsync(db, today);
+        await EnsureNotificationsAsync(db, today);
     }
 
     static async Task SeedCompaniesAsync(RostraDb db)
@@ -102,7 +109,11 @@ public static class SeedData
 
         foreach (var c in Companies)
         {
-            var company = new Company { Name = c.Name, Slug = c.Slug, Accent = c.Accent, TimeZone = c.TimeZone };
+            var company = new Company
+            {
+                Name = c.Name, Slug = c.Slug, Accent = c.Accent, TimeZone = c.TimeZone,
+                DefaultAppearance = $"{{\"scheme\":\"{c.Scheme}\",\"custom\":null}}",
+            };
             db.Companies.Add(company);
             await db.SaveChangesAsync();
 
@@ -184,6 +195,7 @@ public static class SeedData
                 }
 
                 if (w is 0 or 1) AddPendingSwap(week, swapTeam, companies.First(c => c.Id == site.CompanyId), site, sites, w);
+                if (w is 0 or 1) AddOpenShifts(week, swapTeam, site, sites, from, w);
                 db.Shifts.AddRange(week);
             }
         }
@@ -250,6 +262,223 @@ public static class SeedData
         if (cover is not null) shift.PendingCoverId = cover.Id;
     }
 
+    /// <summary>
+    /// A Saturday-dinner open shift at every site, plus a Sunday kitchen shift at the flagship that
+    /// someone has already asked to pick up, so the approval flow has something to show.
+    /// </summary>
+    static void AddOpenShifts(List<Shift> week, List<Staff> team, Site site, List<Site> sites, DateTime monday, int w)
+    {
+        var saturday = monday.AddDays(5);
+        week.Add(new Shift
+        {
+            CompanyId = site.CompanyId, SiteId = site.Id, StaffId = null, Station = Station.Floor,
+            Start = saturday.AddHours(17), End = saturday.AddHours(23), BreakMinutes = 30, Notes = "Extra hands for Saturday dinner",
+        });
+
+        if (w != 1 || sites.First(s => s.CompanyId == site.CompanyId).Id != site.Id) return;
+        var sunday = monday.AddDays(6);
+
+        // A "clopen" (close Saturday, open Sunday) so the roster checks have something real to flag.
+        var closer = team.FirstOrDefault(s =>
+            week.Any(o => o.StaffId == s.Id && o.Start.Date == saturday.Date && o.End.Hour >= 22)
+            && !week.Any(o => o.StaffId == s.Id && o.Start.Date == sunday.Date) && s.AvailableDays.HasFlag(Days.Sun));
+        if (closer is not null)
+            week.Add(new Shift
+            {
+                CompanyId = site.CompanyId, SiteId = site.Id, StaffId = closer.Id, Station = closer.PrimaryStation,
+                Start = sunday.AddHours(7), End = sunday.AddHours(15), BreakMinutes = 30,
+            });
+        var open = new Shift
+        {
+            CompanyId = site.CompanyId, SiteId = site.Id, StaffId = null, Station = Station.Kitchen,
+            Start = sunday.AddHours(11), End = sunday.AddHours(19), BreakMinutes = 30, Notes = "Prep for Monday’s function",
+        };
+        var keen = team.FirstOrDefault(s =>
+            s.Stations.HasFlag(Station.Kitchen) && s.AvailableDays.HasFlag(Days.Sun)
+            && !week.Any(o => o.StaffId == s.Id && o.Start < open.End && open.Start < o.End));
+        open.PendingCoverId = keen?.Id;
+        week.Add(open);
+    }
+
+    /// <summary>
+    /// Past and current weeks are published; next week is published at each flagship site and still a
+    /// draft elsewhere, so managers have both red (published) and green (draft) apples on their tree.
+    /// Rows are only created once, so a manager's later publish or unpublish sticks.
+    /// </summary>
+    static async Task EnsureRosterWeeksAsync(RostraDb db, DateOnly today)
+    {
+        var monday = Week.StartOf(today).ToDateTime(TimeOnly.MinValue);
+        var sites = await db.Sites.IgnoreQueryFilters().ToListAsync();
+        var flagships = sites.GroupBy(s => s.CompanyId).Select(g => g.OrderBy(s => s.Id).First().Id).ToHashSet();
+        var managers = await db.Staff.IgnoreQueryFilters().Where(s => s.Role == StaffRole.Manager)
+            .GroupBy(s => s.CompanyId).Select(g => new { CompanyId = g.Key, Id = g.Min(s => s.Id) }).ToDictionaryAsync(x => x.CompanyId, x => x.Id);
+        var existing = (await db.RosterWeeks.IgnoreQueryFilters().Select(w => new { w.SiteId, w.Start }).ToListAsync())
+            .Select(w => (w.SiteId, w.Start)).ToHashSet();
+        var starts = await db.Shifts.IgnoreQueryFilters().Where(s => s.Start >= monday.AddDays(-28)).Select(s => new { s.SiteId, s.Start }).ToListAsync();
+
+        foreach (var wk in starts.Select(s => (s.SiteId, Start: Week.StartOf(DateOnly.FromDateTime(s.Start)).ToDateTime(TimeOnly.MinValue))).Distinct())
+        {
+            if (existing.Contains(wk)) continue;
+            var site = sites.First(s => s.Id == wk.SiteId);
+            var publish = wk.Start <= monday || (wk.Start == monday.AddDays(7) && flagships.Contains(site.Id));
+            db.RosterWeeks.Add(new RosterWeek
+            {
+                CompanyId = site.CompanyId, SiteId = site.Id, Start = wk.Start, End = wk.Start.AddDays(7),
+                Status = publish ? RosterStatus.Published : RosterStatus.Draft,
+                PublishedAt = publish ? wk.Start.AddDays(-4).AddHours(16) : null,
+                PublishedById = publish ? managers.GetValueOrDefault(site.CompanyId) : null,
+            });
+        }
+        await db.SaveChangesAsync();
+    }
+
+    /// <summary>Demo logins start at different points so their trees show different stages.</summary>
+    static async Task EnsureGrowthAsync(RostraDb db)
+    {
+        var staff = await db.Staff.IgnoreQueryFilters().Where(s => s.ActiveSeconds == 0).ToListAsync();
+        if (staff.Count == 0) return;
+        var hours = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["sam@emberandoak.test"] = 9.2, ["maya@saltbush.test"] = 4.5, ["alex@juniperco.test"] = 14,
+            ["priya@emberandoak.test"] = 2.6, ["matilda@saltbush.test"] = 1.1, ["elena@juniperco.test"] = 5.5,
+        };
+        foreach (var s in staff)
+            s.ActiveSeconds = (long)((hours.TryGetValue(s.Email, out var h) ? h : 0.5 + s.Id * 7919 % 80 / 10.0) * 3600);
+        await db.SaveChangesAsync();
+    }
+
+    static readonly string[] Thanks =
+    [
+        "Thanks for covering my Saturday, legend.", "Saved the pass during the dinner rush tonight.",
+        "Brilliant job training the new starter.", "That prep list was a work of art.",
+        "Thanks for staying back to help close.", "Handled that tricky table like a pro.",
+        "Coffee game was strong this morning.", "Thanks for swapping so I could make the wedding.",
+    ];
+
+    static async Task EnsureKudosAsync(RostraDb db)
+    {
+        if (await db.Kudos.IgnoreQueryFilters().AnyAsync()) return;
+        var people = await db.Staff.IgnoreQueryFilters().Where(s => s.IsActive).OrderBy(s => s.Id).ToListAsync();
+        var demo = DemoAccounts.SelectMany(a => new[] { a.StaffEmail, a.ManagerEmail }).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var now = DateTime.Now;
+        foreach (var team in people.GroupBy(p => p.CompanyId))
+        {
+            var list = team.ToList();
+            var n = 0;
+            foreach (var to in list.Where(p => demo.Contains(p.Email)).Concat(list.Where((p, i) => i % 3 == 1)))
+            {
+                var givers = list.Where(p => p.Id != to.Id).ToList();
+                var count = demo.Contains(to.Email) ? (to.Role == StaffRole.Manager ? 3 : 5) : 1;
+                for (var k = 0; k < count; k++, n++)
+                    db.Kudos.Add(new Kudos
+                    {
+                        CompanyId = team.Key, FromId = givers[(n * 7 + k) % givers.Count].Id, ToId = to.Id,
+                        Message = Thanks[n % Thanks.Length], CreatedAt = now.AddHours(-(n * 13 % 400) - 2),
+                    });
+            }
+        }
+        await db.SaveChangesAsync();
+    }
+
+    static async Task EnsureAnnouncementsAsync(RostraDb db)
+    {
+        if (await db.Announcements.IgnoreQueryFilters().AnyAsync()) return;
+        var sites = await db.Sites.IgnoreQueryFilters().OrderBy(s => s.Id).ToListAsync();
+        var staff = await db.Staff.IgnoreQueryFilters().Where(s => s.IsActive).ToListAsync();
+        var now = DateTime.Now;
+        foreach (var manager in staff.Where(s => s.Role == StaffRole.Manager))
+        {
+            var flagship = sites.First(s => s.CompanyId == manager.CompanyId);
+            var posts = new[]
+            {
+                new Announcement
+                {
+                    CompanyId = manager.CompanyId, SiteId = flagship.Id, AuthorId = manager.Id, RequiresAck = true, CreatedAt = now.AddHours(-20),
+                    Title = "Spring menu tasting, Thursday 3 pm",
+                    Body = $"We’re walking through the new spring menu at {flagship.Name} on Thursday at 3 pm. It’s paid time, so come hungry. Please confirm you’ve seen this.",
+                },
+                new Announcement
+                {
+                    CompanyId = manager.CompanyId, SiteId = null, AuthorId = manager.Id, RequiresAck = false, CreatedAt = now.AddDays(-4),
+                    Title = "Check your availability for the holidays",
+                    Body = "The December rosters go out in three weeks. Update your availability and request leave in Rostra by the end of the month so we can plan around you.",
+                },
+            };
+            db.Announcements.AddRange(posts);
+            await db.SaveChangesAsync();
+            var team = staff.Where(s => s.CompanyId == manager.CompanyId).ToList();
+            foreach (var reader in team.Where((s, i) => i % 2 == 0))
+                db.AnnouncementReads.Add(new AnnouncementRead { CompanyId = manager.CompanyId, AnnouncementId = posts[1].Id, StaffId = reader.Id, ReadAt = now.AddDays(-3) });
+            foreach (var reader in team.Where((s, i) => i % 3 == 0 && s.HomeSiteId == flagship.Id && !DemoAccounts.Any(a => a.StaffEmail == s.Email)))
+                db.AnnouncementReads.Add(new AnnouncementRead { CompanyId = manager.CompanyId, AnnouncementId = posts[0].Id, StaffId = reader.Id, ReadAt = now.AddHours(-10) });
+        }
+        await db.SaveChangesAsync();
+    }
+
+    /// <summary>Last week's timesheets are half approved, so both states show up.</summary>
+    static async Task EnsureTimesheetsAsync(RostraDb db, DateOnly today)
+    {
+        if (await db.TimesheetApprovals.IgnoreQueryFilters().AnyAsync()) return;
+        var lastWeek = Week.StartOf(today).AddDays(-7).ToDateTime(TimeOnly.MinValue);
+        var workers = await db.Shifts.IgnoreQueryFilters()
+            .Where(s => s.StaffId != null && s.Start >= lastWeek && s.Start < lastWeek.AddDays(7))
+            .Select(s => new { s.CompanyId, StaffId = s.StaffId!.Value }).Distinct().ToListAsync();
+        var managers = await db.Staff.IgnoreQueryFilters().Where(s => s.Role == StaffRole.Manager)
+            .ToDictionaryAsync(s => s.CompanyId, s => s.Id);
+        foreach (var w in workers.Where((w, i) => i % 2 == 0))
+            db.TimesheetApprovals.Add(new TimesheetApproval
+            {
+                CompanyId = w.CompanyId, StaffId = w.StaffId, WeekStart = lastWeek,
+                ApprovedAt = lastWeek.AddDays(8).AddHours(10), ApprovedById = managers[w.CompanyId],
+            });
+        await db.SaveChangesAsync();
+    }
+
+    /// <summary>A starter set of bell notifications so the menu reads like a real working week.</summary>
+    static async Task EnsureNotificationsAsync(RostraDb db, DateOnly today)
+    {
+        if (await db.Notifications.IgnoreQueryFilters().AnyAsync()) return;
+        var monday = Week.StartOf(today).ToDateTime(TimeOnly.MinValue);
+        var now = DateTime.Now;
+        var people = await db.Staff.IgnoreQueryFilters().Where(s => s.IsActive).ToListAsync();
+        var published = await db.RosterWeeks.IgnoreQueryFilters().Where(w => w.Status == RosterStatus.Published && w.Start >= monday).ToListAsync();
+        var shifts = await db.Shifts.IgnoreQueryFilters().Where(s => s.StaffId != null && s.Start >= monday && s.Start < monday.AddDays(14)).ToListAsync();
+        var siteNames = await db.Sites.IgnoreQueryFilters().ToDictionaryAsync(s => s.Id, s => s.Name);
+
+        foreach (var week in published)
+            foreach (var person in shifts.Where(s => s.SiteId == week.SiteId && s.Start >= week.Start && s.Start < week.End).GroupBy(s => s.StaffId!.Value))
+                db.Notifications.Add(new Notification
+                {
+                    CompanyId = week.CompanyId, StaffId = person.Key, Kind = "roster", Link = "/app/my-shifts",
+                    Title = $"Your Week {Week.Number(week.Start)} roster is out",
+                    Body = $"{person.Count()} {(person.Count() == 1 ? "shift" : "shifts")}, {person.Sum(s => s.PaidHours):0.#} h at {siteNames[week.SiteId]}.",
+                    CreatedAt = week.PublishedAt ?? now, ReadAt = week.Start < monday.AddDays(7) ? now : null,
+                });
+
+        var kudos = await db.Kudos.IgnoreQueryFilters().Include(k => k.From).OrderByDescending(k => k.CreatedAt).Take(60).ToListAsync();
+        foreach (var k in kudos)
+            db.Notifications.Add(new Notification
+            {
+                CompanyId = k.CompanyId, StaffId = k.ToId, Kind = "kudos", Link = "/app/home",
+                Title = $"{k.From!.Name} sent you kudos", Body = $"“{k.Message}”", CreatedAt = k.CreatedAt,
+                ReadAt = k.CreatedAt < now.AddDays(-2) ? now : null,
+            });
+
+        var pending = await db.Shifts.IgnoreQueryFilters().Include(s => s.Staff).Include(s => s.PendingCover)
+            .Where(s => s.PendingCoverId != null).ToListAsync();
+        foreach (var s in pending)
+            foreach (var manager in people.Where(p => p.CompanyId == s.CompanyId && p.Role == StaffRole.Manager))
+                db.Notifications.Add(new Notification
+                {
+                    CompanyId = s.CompanyId, StaffId = manager.Id, Kind = s.StaffId is null ? "open-shift" : "swap", Link = "/app/swaps",
+                    Title = s.Staff is null
+                        ? $"{s.PendingCover!.Name} wants to pick up {Week.Label(s.Start, s.End)}"
+                        : $"{s.Staff.Name} asked {s.PendingCover!.Name} to cover {Week.Label(s.Start, s.End)}",
+                    Body = "Needs your approval", CreatedAt = now.AddHours(-3),
+                });
+        await db.SaveChangesAsync();
+    }
+
     static (int Start, int End, int Break)? Template(char code) => code switch
     {
         'E' => (6 * 60 + 30, 14 * 60 + 30, 30), // early, 6:30–2:30
@@ -284,6 +513,7 @@ public static class SeedData
     }
 
     static readonly string[] Reasons = ["Uni exams", "Family wedding", "Medical appointment", "Moving house", "Sister’s graduation", "Weekend away"];
+    static readonly LeaveType[] ReasonTypes = [LeaveType.Personal, LeaveType.Annual, LeaveType.Sick, LeaveType.Personal, LeaveType.Annual, LeaveType.Annual];
 
     /// <summary>Keeps a few pending time-off requests in the near future, and someone on leave today.</summary>
     static async Task EnsureTimeOffAsync(RostraDb db, DateOnly today)
@@ -305,7 +535,7 @@ public static class SeedData
                 db.TimeOff.Add(new TimeOffRequest
                 {
                     CompanyId = team.Key, StaffId = people[i * 5 + 1].Id, From = from, To = from.AddDays(i % 2),
-                    Reason = Reasons[(team.Key + i) % Reasons.Length], Status = RequestStatus.Pending,
+                    Reason = Reasons[(team.Key + i) % Reasons.Length], Type = ReasonTypes[(team.Key + i) % Reasons.Length], Status = RequestStatus.Pending,
                     CreatedAt = DateTime.Now.AddHours(-6 - i * 9),
                 });
             }

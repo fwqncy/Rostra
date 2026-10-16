@@ -7,7 +7,8 @@ public class Shift
     public int SiteId { get; set; }
     public Site? Site { get; set; }
 
-    public int StaffId { get; set; }
+    /// <summary>Null for an open shift that anyone suitable can ask to pick up.</summary>
+    public int? StaffId { get; set; }
     public Staff? Staff { get; set; }
 
     /// <summary>Venue-local time. Restaurants roster in wall-clock time, not UTC.</summary>
@@ -17,11 +18,15 @@ public class Shift
     public Station Station { get; set; }
     public string? Notes { get; set; }
 
-    /// <summary>Set when the rostered person has asked someone to cover; cleared on approve/decline.</summary>
+    /// <summary>
+    /// Who's waiting to take this shift: a swap cover, or someone asking to pick up an open shift.
+    /// Cleared on approve/decline.
+    /// </summary>
     public int? PendingCoverId { get; set; }
     public Staff? PendingCover { get; set; }
 
     public double PaidHours => Math.Max(0, (End - Start).TotalHours - BreakMinutes / 60.0);
+    public bool IsOpen => StaffId is null;
 }
 
 public record SwapRequest(int CoverId);

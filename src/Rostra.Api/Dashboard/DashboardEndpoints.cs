@@ -22,8 +22,8 @@ public static class DashboardEndpoints
         manager.MapGet("/dashboard/week", GetWeek);
         manager.MapGet("/clock/feed", GetFeed);
         manager.MapPost("/clock/manual", ManualClock);
-        manager.MapPost("/time-off/{id:int}/approve", (int id, RostraDb db, EventHub hub) => ResolveTimeOff(id, RequestStatus.Approved, db, hub));
-        manager.MapPost("/time-off/{id:int}/decline", (int id, RostraDb db, EventHub hub) => ResolveTimeOff(id, RequestStatus.Declined, db, hub));
+        manager.MapPost("/time-off/{id:int}/approve", (int id, RostraDb db, EventHub hub, Inbox inbox) => ResolveTimeOff(id, RequestStatus.Approved, db, hub, inbox));
+        manager.MapPost("/time-off/{id:int}/decline", (int id, RostraDb db, EventHub hub, Inbox inbox) => ResolveTimeOff(id, RequestStatus.Declined, db, hub, inbox));
         manager.MapPost("/revenue", UploadRevenue);
 
         app.MapPost("/clock", ClockMe).RequireAuthorization("Staff");
@@ -34,12 +34,21 @@ public static class DashboardEndpoints
        --------------------------------------------------------------------- */
     sealed record Row(Shift Shift, string Name, string Title, decimal Rate, DateTime? In, DateTime? Out);
 
+    /// <summary>Open shifts have no rate yet; plan with the team's average.</summary>
+    static async Task<decimal> AverageRateAsync(RostraDb db)
+    {
+        // SQLite can't average decimals, so average in memory (it's one small column).
+        var rates = await db.Staff.Where(s => s.IsActive && s.Role == StaffRole.Staff).Select(s => s.HourlyRate).ToListAsync();
+        return rates.Count > 0 ? rates.Average() : 30m;
+    }
+
     static async Task<List<Row>> LoadRowsAsync(RostraDb db, DateTime from, DateTime to, int? siteId, Station? station = null)
     {
         var query = db.Shifts.AsNoTracking().Include(s => s.Staff).Where(s => s.Start >= from && s.Start < to);
         if (siteId is int site) query = query.Where(s => s.SiteId == site);
         if (station is { } st and not Station.None) query = query.Where(s => s.Station == st);
         var shifts = await query.OrderBy(s => s.Start).ToListAsync();
+        var average = shifts.Any(s => s.Staff is null) ? await AverageRateAsync(db) : 0m;
 
         var ids = shifts.Select(s => s.Id).ToList();
         var punches = await db.ClockEvents
@@ -50,7 +59,7 @@ public static class DashboardEndpoints
         var outs = punches.Where(p => p.Kind == ClockKind.Out).GroupBy(p => p.Id).ToDictionary(g => g.Key, g => g.Max(p => p.At));
 
         return shifts.Select(s => new Row(
-            s, s.Staff!.Name, s.Staff.Title, s.Staff.HourlyRate,
+            s, s.Staff?.Name ?? "Open shift", s.Staff?.Title ?? "Unfilled", s.Staff?.HourlyRate ?? average,
             ins.TryGetValue(s.Id, out var i) ? i : null,
             outs.TryGetValue(s.Id, out var o) ? o : null)).ToList();
     }
@@ -117,10 +126,32 @@ public static class DashboardEndpoints
             .Select(r => new { ShiftId = r.Shift.Id, r.Name, r.Shift.SiteId, r.Shift.Start, r.Shift.End })
             .ToList();
 
-        return Results.Ok(new { Swaps = swaps, TimeOff = timeOff, Certifications = certifications, NextWeek = budgets, NextWeekStart = DateOnly.FromDateTime(nextMonday), Late = late });
+        // Rosters that still need publishing: this week and next, per site.
+        var thisMonday = Week.StartOf(today).ToDateTime(TimeOnly.MinValue);
+        var publishedWeeks = await db.RosterWeeks
+            .Where(w => w.Status == RosterStatus.Published && (w.Start == thisMonday || w.Start == nextMonday))
+            .Select(w => new { w.SiteId, w.Start }).ToListAsync();
+        var weeksWithShifts = await db.Shifts.Where(s => s.Start >= thisMonday && s.Start < nextMonday.AddDays(7))
+            .Select(s => new { s.SiteId, s.Start }).ToListAsync();
+        var unpublished = weeksWithShifts
+            .Select(s => new { s.SiteId, Start = s.Start < nextMonday ? thisMonday : nextMonday })
+            .Distinct()
+            .Where(w => !publishedWeeks.Any(p => p.SiteId == w.SiteId && p.Start == w.Start))
+            .Select(w => new { w.SiteId, Site = sites.First(s => s.Id == w.SiteId).Name, WeekStart = DateOnly.FromDateTime(w.Start), WeekNumber = Week.Number(w.Start) })
+            .OrderBy(w => w.WeekStart).ToList();
+
+        var openShifts = await db.Shifts.Where(s => s.StaffId == null && s.Start > now && s.Start < nextMonday.AddDays(7))
+            .Select(s => new { s.Id, s.SiteId, s.Start, s.End, Claimed = s.PendingCoverId != null }).ToListAsync();
+
+        return Results.Ok(new
+        {
+            Swaps = swaps, TimeOff = timeOff, Certifications = certifications, NextWeek = budgets, NextWeekStart = DateOnly.FromDateTime(nextMonday),
+            Late = late, Unpublished = unpublished,
+            OpenShifts = new { Total = openShifts.Count, Unclaimed = openShifts.Count(o => !o.Claimed) },
+        });
     }
 
-    static async Task<IResult> ResolveTimeOff(int id, RequestStatus status, RostraDb db, EventHub hub)
+    static async Task<IResult> ResolveTimeOff(int id, RequestStatus status, RostraDb db, EventHub hub, Inbox inbox)
     {
         var request = await db.TimeOff.Include(t => t.Staff).FirstOrDefaultAsync(t => t.Id == id);
         if (request is null) return Results.NotFound();
@@ -129,6 +160,12 @@ public static class DashboardEndpoints
 
         request.Status = status;
         await db.SaveChangesAsync();
+        var span = request.From == request.To
+            ? request.From.ToString("ddd d MMM", System.Globalization.CultureInfo.InvariantCulture)
+            : $"{request.From.ToString("d MMM", System.Globalization.CultureInfo.InvariantCulture)} – {request.To.ToString("d MMM", System.Globalization.CultureInfo.InvariantCulture)}";
+        await inbox.SendAsync([request.StaffId], "leave",
+            status == RequestStatus.Approved ? $"Leave approved: {span}" : $"Leave declined: {span}",
+            status == RequestStatus.Approved ? "Enjoy the time off." : "Talk to your manager if you need to change dates.", "/app/home");
         hub.Publish(request.CompanyId, "timeoff", new { id, status = status.ToString() });
         return Results.Ok(new { id, status });
     }
@@ -155,7 +192,7 @@ public static class DashboardEndpoints
             Shifts = rows.Select(r => new
             {
                 r.Shift.Id, r.Shift.StaffId, r.Name, r.Title, r.Shift.Station, r.Shift.Start, r.Shift.End,
-                r.Shift.BreakMinutes, ClockIn = r.In, ClockOut = r.Out,
+                r.Shift.BreakMinutes, ClockIn = r.In, ClockOut = r.Out, IsOpen = r.Shift.StaffId == null,
             }),
             OnLeave = onLeave,
         });
@@ -224,7 +261,9 @@ public static class DashboardEndpoints
     static async Task<Punch> PunchAsync(RostraDb db, int staffId, ClockKind? kind, DateTime at, string source)
     {
         var window = source == "App" ? TimeSpan.FromHours(2) : TimeSpan.FromHours(4);
-        var candidates = await db.Shifts
+        // Staff can only clock against published shifts; managers can record punches for any.
+        var shifts = source == "App" ? db.PublishedShifts : db.Shifts;
+        var candidates = await shifts
             .Where(s => s.StaffId == staffId && s.Start <= at + window && s.End >= at - window)
             .Select(s => new
             {

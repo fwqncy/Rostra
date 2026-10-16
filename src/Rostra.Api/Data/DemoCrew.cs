@@ -28,9 +28,10 @@ public static class DemoCrew
 
     static async Task TickCompanyAsync(RostraDb db, int companyId, DateTime now, HashSet<(int Company, int Site)> changed)
     {
-        var since = now.AddDays(-8);
+        var since = now.AddDays(-15); // covers all of last week, for timesheets
         var shifts = await db.Shifts.IgnoreQueryFilters()
-            .Where(s => s.CompanyId == companyId && s.Start >= since && s.Start <= now.AddMinutes(15))
+            .Where(s => s.CompanyId == companyId && s.StaffId != null && s.Start >= since && s.Start <= now.AddMinutes(15)
+                        && db.RosterWeeks.IgnoreQueryFilters().Any(w => w.SiteId == s.SiteId && w.Status == RosterStatus.Published && w.Start <= s.Start && s.Start < w.End))
             .Select(s => new { s.Id, s.CompanyId, s.SiteId, s.StaffId, s.Start, s.End, s.Staff!.Email })
             .ToListAsync();
         if (shifts.Count == 0) return;
@@ -54,13 +55,13 @@ public static class DemoCrew
             var isIn = hasIn.Contains(s.Id);
             if (!isIn && clockIn <= now)
             {
-                db.ClockEvents.Add(new ClockEvent { CompanyId = s.CompanyId, SiteId = s.SiteId, StaffId = s.StaffId, ShiftId = s.Id, At = clockIn, Kind = ClockKind.In });
+                db.ClockEvents.Add(new ClockEvent { CompanyId = s.CompanyId, SiteId = s.SiteId, StaffId = s.StaffId!.Value, ShiftId = s.Id, At = clockIn, Kind = ClockKind.In });
                 isIn = true;
                 changed.Add((s.CompanyId, s.SiteId));
             }
             if (isIn && !hasOut.Contains(s.Id) && clockOut <= now)
             {
-                db.ClockEvents.Add(new ClockEvent { CompanyId = s.CompanyId, SiteId = s.SiteId, StaffId = s.StaffId, ShiftId = s.Id, At = clockOut, Kind = ClockKind.Out });
+                db.ClockEvents.Add(new ClockEvent { CompanyId = s.CompanyId, SiteId = s.SiteId, StaffId = s.StaffId!.Value, ShiftId = s.Id, At = clockOut, Kind = ClockKind.Out });
                 changed.Add((s.CompanyId, s.SiteId));
             }
         }

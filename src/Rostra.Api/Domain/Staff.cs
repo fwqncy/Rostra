@@ -46,6 +46,18 @@ public class Staff
     public string? Certification { get; set; }
     public DateOnly? CertificationExpires { get; set; }
 
+    /// <summary>Time spent actively using Rostra. It grows the tree on Home.</summary>
+    public long ActiveSeconds { get; set; }
+    public DateTime? LastActiveAt { get; set; }
+
+    /// <summary>Secret for the personal calendar feed (webcal). Reset it to revoke old links.</summary>
+    public string CalendarToken { get; set; } = NewToken();
+
+    /// <summary>JSON: colour scheme, custom colour, light/dark mode and motion. Follows the person across devices.</summary>
+    public string? Appearance { get; set; }
+
+    public static string NewToken() => Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+
     public ICollection<Shift> Shifts
     {
         get => LazyLoader.Load(this, ref _shifts) ?? (_shifts = new List<Shift>());

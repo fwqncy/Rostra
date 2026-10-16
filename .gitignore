@@ -8,3 +8,5 @@ obj/
 *.db-shm
 *.db-wal
 .azure/
+.DS_Store
+node_modules/

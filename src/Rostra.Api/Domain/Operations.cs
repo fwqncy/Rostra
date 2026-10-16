@@ -20,6 +20,8 @@ public class ClockEvent
 
 public enum RequestStatus { Pending, Approved, Declined }
 
+public enum LeaveType { Annual, Sick, Personal, Unpaid, Other }
+
 /// <summary>Staff asking not to be rostered on these days.</summary>
 public class TimeOffRequest
 {
@@ -30,6 +32,7 @@ public class TimeOffRequest
     public DateOnly From { get; set; }
     public DateOnly To { get; set; }
     public required string Reason { get; set; }
+    public LeaveType Type { get; set; } = LeaveType.Annual;
     public RequestStatus Status { get; set; }
     public DateTime CreatedAt { get; set; }
 }

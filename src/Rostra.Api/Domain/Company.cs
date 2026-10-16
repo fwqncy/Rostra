@@ -15,6 +15,11 @@ public class Company
     /// <summary>IANA zone the venues trade in. Shift times are wall-clock in this zone.</summary>
     public string TimeZone { get; set; } = "Australia/Brisbane";
 
+    /// <summary>JSON: the colour scheme staff see until they pick their own.</summary>
+    public string? DefaultAppearance { get; set; }
+
+    public bool SouthernHemisphere => TimeZone.StartsWith("Australia/") || TimeZone is "Pacific/Auckland" or "Pacific/Chatham";
+
     public List<Site> Sites { get; set; } = [];
 }
 

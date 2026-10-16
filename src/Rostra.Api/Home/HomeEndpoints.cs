@@ -8,7 +8,7 @@ using Rostra.Api.Infrastructure;
 namespace Rostra.Api.Home;
 
 public record AvailabilityInput(string[]? Days);
-public record LeaveInput(DateOnly? From, DateOnly? To, string? Reason);
+public record LeaveInput(DateOnly? From, DateOnly? To, string? Reason, LeaveType? Type);
 
 /// <summary>The personal "Home" screen: next shift, this week's pay, availability and leave.</summary>
 public static class HomeEndpoints
@@ -30,7 +30,7 @@ public static class HomeEndpoints
         var now = await db.NowAsync();
         var today = DateOnly.FromDateTime(now);
 
-        var next = await db.Shifts
+        var next = await db.PublishedShifts
             .Where(s => s.StaffId == me.Id && s.End > now)
             .OrderBy(s => s.Start)
             .Select(s => new
@@ -44,7 +44,7 @@ public static class HomeEndpoints
         // This week's pay: finished shifts use clocked time when there is some, the rest use the roster.
         var monday = Week.StartOf(today);
         var from = monday.ToDateTime(TimeOnly.MinValue);
-        var shifts = await db.Shifts.AsNoTracking()
+        var shifts = await db.PublishedShifts.AsNoTracking()
             .Where(s => s.StaffId == me.Id && s.Start >= from && s.Start < from.AddDays(7))
             .ToListAsync();
         var ids = shifts.Select(s => s.Id).ToList();
@@ -79,7 +79,7 @@ public static class HomeEndpoints
         var leave = await db.TimeOff
             .Where(t => t.StaffId == me.Id && t.To >= today.AddDays(-30))
             .OrderBy(t => t.From)
-            .Select(t => new { t.Id, t.From, t.To, t.Reason, t.Status })
+            .Select(t => new { t.Id, t.From, t.To, t.Reason, t.Type, t.Status })
             .ToListAsync();
 
         return Results.Ok(new
@@ -115,7 +115,7 @@ public static class HomeEndpoints
         return Results.Ok(new { Availability = Week7.Where(d => days.HasFlag(d)).Select(d => d.ToString()) });
     }
 
-    static async Task<IResult> RequestLeave(LeaveInput input, ClaimsPrincipal user, RostraDb db, EventHub hub)
+    static async Task<IResult> RequestLeave(LeaveInput input, ClaimsPrincipal user, RostraDb db, EventHub hub, Inbox inbox)
     {
         var today = DateOnly.FromDateTime(await db.NowAsync());
         var reason = input.Reason?.Trim() ?? "";
@@ -125,6 +125,7 @@ public static class HomeEndpoints
         if (input.To is not { } to) errors["to"] = ["Choose your last day off."];
         else if (input.From is { } f && to < f) errors["to"] = ["The last day must be on or after the first day."];
         else if (input.From is { } f2 && to.DayNumber - f2.DayNumber > 60) errors["to"] = ["Leave can be up to 60 days at a time."];
+        if (input.Type is { } type && !Enum.IsDefined(type)) errors["type"] = ["Choose a leave type."];
         if (reason.Length == 0) errors["reason"] = ["Add a short reason, like “Family wedding”."];
         else if (reason.Length > 200) errors["reason"] = ["Keep the reason to 200 characters."];
         if (errors.Count > 0) return Results.ValidationProblem(errors);
@@ -138,6 +139,7 @@ public static class HomeEndpoints
         var request = new TimeOffRequest
         {
             CompanyId = me.CompanyId, StaffId = me.Id, From = input.From!.Value, To = input.To!.Value, Reason = reason,
+            Type = input.Type ?? LeaveType.Annual,
             // Managers are the approvers, so their own leave is recorded as approved.
             Status = me.Role == StaffRole.Manager ? RequestStatus.Approved : RequestStatus.Pending,
             CreatedAt = await db.NowAsync(),
@@ -149,8 +151,12 @@ public static class HomeEndpoints
         var end = request.To.ToDateTime(TimeOnly.MinValue).AddDays(1);
         var rostered = await db.Shifts.CountAsync(s => s.StaffId == me.Id && s.Start >= start && s.Start < end);
 
+        if (request.Status == RequestStatus.Pending)
+            await inbox.SendAsync(await inbox.ManagerIdsAsync(), "leave", $"{me.Name} requested {request.Type.ToString().ToLowerInvariant()} leave",
+                $"{request.From:d MMM} – {request.To:d MMM}: {reason}" + (rostered > 0 ? $" Rostered on {rostered} {(rostered == 1 ? "shift" : "shifts")} then." : ""),
+                "/app/dashboard?open=timeoff");
         hub.Publish(me.CompanyId, "timeoff", new { id = request.Id, status = request.Status.ToString() });
-        return Results.Created($"/me/time-off/{request.Id}", new { request.Id, request.From, request.To, request.Reason, request.Status, RosteredShifts = rostered });
+        return Results.Created($"/me/time-off/{request.Id}", new { request.Id, request.From, request.To, request.Reason, request.Type, request.Status, RosteredShifts = rostered });
     }
 
     static async Task<IResult> CancelLeave(int id, ClaimsPrincipal user, RostraDb db, EventHub hub)

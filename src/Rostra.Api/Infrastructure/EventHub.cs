@@ -16,20 +16,21 @@ public sealed record ServerEvent(string Type, object? Data)
 /// </summary>
 public sealed class EventHub
 {
-    readonly ConcurrentDictionary<Guid, (int CompanyId, Channel<ServerEvent> Channel)> _subscribers = new();
+    readonly ConcurrentDictionary<Guid, (int CompanyId, int StaffId, Channel<ServerEvent> Channel)> _subscribers = new();
 
-    public void Publish(int companyId, string type, object data)
+    /// <summary>Sends to everyone in the company, or to one person's open tabs when <paramref name="staffId"/> is set.</summary>
+    public void Publish(int companyId, string type, object data, int? staffId = null)
     {
         foreach (var (_, sub) in _subscribers)
-            if (sub.CompanyId == companyId)
+            if (sub.CompanyId == companyId && (staffId is null || sub.StaffId == staffId))
                 sub.Channel.Writer.TryWrite(new ServerEvent(type, data));
     }
 
-    public async IAsyncEnumerable<ServerEvent> Subscribe(int companyId, [EnumeratorCancellation] CancellationToken ct)
+    public async IAsyncEnumerable<ServerEvent> Subscribe(int companyId, int staffId, [EnumeratorCancellation] CancellationToken ct)
     {
         var id = Guid.NewGuid();
         var channel = Channel.CreateBounded<ServerEvent>(new BoundedChannelOptions(64) { FullMode = BoundedChannelFullMode.DropOldest });
-        _subscribers[id] = (companyId, channel);
+        _subscribers[id] = (companyId, staffId, channel);
         try
         {
             while (!ct.IsCancellationRequested)
@@ -59,11 +60,16 @@ public interface INotifier
     Task ManagerAsync(Shift shift, Staff cover);
 }
 
-/// <summary>Pushes swap requests to managers' open dashboards the moment they're made.</summary>
-public sealed class LiveNotifier(EventHub hub, ILogger<LiveNotifier> log) : INotifier
+/// <summary>Pushes swap requests to managers' open dashboards the moment they're made, and drops them in the bell menu.</summary>
+public sealed class LiveNotifier(EventHub hub, Inbox inbox, ILogger<LiveNotifier> log) : INotifier
 {
-    public Task ManagerAsync(Shift shift, Staff cover)
+    public async Task ManagerAsync(Shift shift, Staff cover)
     {
+        var when = Week.Label(shift.Start, shift.End);
+        var from = shift.Staff?.Name ?? "Someone";
+        await inbox.SendAsync(await inbox.ManagerIdsAsync(), "swap", $"{from} asked {cover.Name} to cover {when}", "Needs your approval", "/app/swaps");
+        await inbox.SendAsync([cover.Id], "swap", $"{from} asked you to cover {when}", "Your manager will confirm it", "/app/swaps");
+
         hub.Publish(shift.CompanyId, "swap.requested", new
         {
             shiftId = shift.Id,
@@ -74,6 +80,5 @@ public sealed class LiveNotifier(EventHub hub, ILogger<LiveNotifier> log) : INot
             end = shift.End,
         });
         log.LogInformation("Swap requested on shift {ShiftId}: {From} → {Cover}", shift.Id, shift.Staff?.Name, cover.Name);
-        return Task.CompletedTask;
     }
 }
